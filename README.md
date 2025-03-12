@@ -58,4 +58,4 @@ add_scene_descriptions_to_srt(
 
 ## ライセンス
 
-MIT License 
+MIT License "# scene_description_generator" 
