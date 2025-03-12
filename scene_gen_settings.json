@@ -1,0 +1,16 @@
+{
+    "language": "ja",
+    "gemini_api_key": "AIzaSyCztyJmLgpfj9ko5G5Y48AxnzP2Nj78xYM",
+    "serper_api_key": "0c939952353f8ab495951a1420a13b1f5b08001d",
+    "scene_duration": 10,
+    "last_input_file": "G:/100GOPRO/output.srt",
+    "last_output_file": "G:/100GOPRO\\output_with_scenes.srt",
+    "last_scenario_file": "",
+    "disable_web_search": true,
+    "output_languages": {
+        "ja": true,
+        "en": false,
+        "zh": false,
+        "ko": false
+    }
+}
