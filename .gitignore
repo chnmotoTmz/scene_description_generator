@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# Temporary files
+.temp/
+temp/
+tmp/
+
+# Model cache
+models/
+
+# Media files
+*.mp4
+*.mp3
+*.wav
+*.jpg
+*.png
+
+# Output directories
+output/
+keyframes/
+analysis_results/ 

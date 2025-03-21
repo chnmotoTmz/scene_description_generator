@@ -1,61 +1,94 @@
-# Scene Description Generator
+# シーン説明ジェネレーター
 
-シーン説明生成ツール - 動画のシーン説明を自動生成するPythonライブラリ
+登山動画から自動的にシーンを検出し、各シーンの説明文を生成するアプリケーションです。音声認識、画像分析、自然言語処理を組み合わせて、動画コンテンツを効率的に管理・編集するためのツールです。
 
-## 機能
+## 主な機能
 
-- SRTファイルからシーン説明を自動生成
-- 複数言語対応（日本語、英語、中国語、韓国語）
-- シナリオファイルを利用した生成
-- ウェブ検索機能（オプション）
-- 使いやすいGUIインターフェース
+- **シーン検出**: 動画から自動的にシーンを検出
+- **音声認識**: 各シーンの音声を文字起こし
+- **シーン説明生成**: 映像と音声から自動的にシーンの説明文を生成
+- **シーン分析**: 各シーンの文脈や編集のヒントを提供
+- **プレビュー生成**: 各シーンのサムネイルとプレビュー動画を生成
+- **シーン管理**: シーンの再生、保存、編集が可能
+- **サイレントシーン検出**: 音声のないシーンを自動的に識別
 
-## インストール
+## セットアップ
 
+### 必要条件
+
+- Python 3.10以上
+- FFmpeg（動画処理用）
+- VLC Player（推奨：シーンプレビュー用）
+
+### インストール手順
+
+1. リポジトリをクローン：
+```bash
+git clone [repository-url]
+cd scene_description_generator
+```
+
+2. 必要なパッケージをインストール：
 ```bash
 pip install -r requirements.txt
 ```
 
-## 環境設定
-
-1. `.env`ファイルを作成し、以下の環境変数を設定：
-
-```env
-GEMINI_API_KEY=your_gemini_api_key
-SERPER_API_KEY=your_serper_api_key
+3. 環境変数の設定：
+`.env`ファイルを作成し、以下の内容を設定：
+```
+OPENAI_API_KEY=your_api_key_here
+AZURE_API_KEY=your_azure_key_here
+AZURE_ENDPOINT=your_azure_endpoint_here
 ```
 
 ## 使用方法
 
-### GUIアプリケーションの起動
-
+1. アプリケーションを起動：
 ```bash
-python scene_description_generator_gui.py
+python video_enhanced.py
 ```
 
-### プログラムからの使用
+2. 「ファイルを選択」ボタンをクリックし、処理したい動画ファイルを選択
 
-```python
-from scene_description_generator import generate_captions_from_scenario, add_scene_descriptions_to_srt
+3. 「処理開始」ボタンをクリックして、シーン検出と分析を開始
 
-# シナリオファイルを使用する場合
-generate_captions_from_scenario(
-    input_srt="input.srt",
-    output_srt="output.srt",
-    scenario_file="scenario.txt",
-    scene_duration=10,
-    language="ja"
-)
+4. 処理が完了すると、各シーンの詳細情報が表示されます：
+   - シーンのサムネイル
+   - シーンの説明
+   - 音声の文字起こし
+   - シーンの文脈分析
+   - 編集提案
 
-# シナリオなしで生成する場合
-add_scene_descriptions_to_srt(
-    input_srt="input.srt",
-    output_srt="output.srt",
-    scene_duration=10,
-    language="ja"
-)
-```
+5. 各シーンで利用可能な操作：
+   - シーンの再生（サムネイルまたは再生ボタンをクリック）
+   - シーンの保存（「シーン保存」ボタンをクリック）
+   - シーンの詳細表示
+
+## ファイル構成
+
+- `video_enhanced.py`: メインアプリケーション
+- `api_client.py`: API通信用クライアント
+- `requirements.txt`: 必要なPythonパッケージの一覧
+- `.env`: 環境変数設定ファイル
+
+## 技術仕様
+
+- **シーン検出**: PySceneDetectを使用
+- **音声認識**: Faster Whisper（Systran版）を使用
+- **画像分析**: Azure Computer Visionを使用
+- **自然言語処理**: OpenAI GPT-4を使用
+- **動画処理**: FFmpegを使用
+
+## 注意事項
+
+- 処理には十分なディスク容量が必要です
+- 音声認識の精度は環境音や話者の声質に依存します
+- APIキーの利用には各サービスの利用規約が適用されます
 
 ## ライセンス
 
-MIT License "# scene_description_generator" 
+MITライセンス
+
+## 作者
+
+[Your Name]
