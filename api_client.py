@@ -74,6 +74,8 @@ class WhisperClient:
             )
             
             self.batch_size = batch_size
+            # 無音区間を判定する基準となる時間（秒）
+            self.chunk_duration = 1.0
             logger.info(f"faster-whisper {model_size}モデルを{device}モードで初期化しました")
             
         except Exception as e:
@@ -235,32 +237,29 @@ class WhisperClient:
                     )
                 )
                 
+                # セグメントをリストに変換
+                segments_list = list(segments)
+                
                 # セグメントから無音区間と文字起こしを抽出
                 scene_boundaries = []
                 transcripts = []
                 
-                for i in range(len(segments) - 1):
-                    current_seg = segments[i]
-                    next_seg = segments[i + 1]
-                    
+                for i, segment in enumerate(segments_list):
+                    # 各セグメントをトランスクリプトに追加
                     transcripts.append({
-                        "start": current_seg.start,
-                        "end": current_seg.end,
-                        "text": current_seg.text
+                        "start": segment.start,
+                        "end": segment.end,
+                        "text": segment.text
                     })
                     
-                    gap = next_seg.start - current_seg.end
-                    if gap >= self.chunk_duration:
-                        scene_boundaries.append(current_seg.end)
+                    # 次のセグメントとの間に無音区間があるか確認
+                    if i < len(segments_list) - 1:
+                        next_seg = segments_list[i + 1]
+                        gap = next_seg.start - segment.end
+                        if gap >= self.chunk_duration:
+                            scene_boundaries.append(segment.end)
                 
-                # 最後のセグメントを追加
-                if segments:
-                    last_seg = segments[-1]
-                    transcripts.append({
-                        "start": last_seg.start,
-                        "end": last_seg.end,
-                        "text": last_seg.text
-                    })
+                logger.info(f"文字起こし完了: {len(transcripts)}個のセグメント、{len(scene_boundaries)}個の無音区間")
                 
                 return {
                     "scene_boundaries": scene_boundaries,
@@ -282,7 +281,10 @@ class WhisperClient:
         
         except Exception as e:
             logger.error(f"動画処理中にエラー: {str(e)}")
-            raise
+            import traceback
+            logger.error(traceback.format_exc())
+            # エラー時は空の結果を返す
+            return {"transcripts": [], "scene_boundaries": []}
 
 class GeminiClient:
     def __init__(self):
@@ -302,6 +304,26 @@ class GeminiClient:
             logger.error("google-generativeaiライブラリがインストールされていません")
             raise ImportError("google-generativeaiパッケージをインストールしてください: pip install google-generativeai")
     
+    def generate_content(self, prompt: str) -> str:
+        """テキストプロンプトからコンテンツを生成"""
+        try:
+            logger.info("Geminiコンテンツ生成開始")
+            response = self.model.generate_content(prompt)
+            
+            if response.text:
+                logger.info("Geminiコンテンツ生成完了")
+                return response.text
+            else:
+                logger.warning("Geminiコンテンツ生成結果が空です")
+                return ""
+                
+        except Exception as e:
+            error_msg = f"Geminiコンテンツ生成中にエラーが発生: {str(e)}"
+            logger.error(error_msg)
+            import traceback
+            logger.error(traceback.format_exc())
+            return f"エラー: {type(e).__name__}"
+    
     def analyze_image(self, image_path: str) -> str:
         """画像をGemini APIで分析"""
         if not os.path.exists(image_path):
@@ -315,13 +337,22 @@ class GeminiClient:
             img = Image.open(image_path)
             
             # 分析実行
-            prompt = "この画像を詳細に説明してください。映像のシーンとして何が映っているか、視覚的特徴を具体的に説明してください。"
+            prompt = """
+            この画像を簡潔に説明してください。
+            映像のシーンとして何が映っているか、最も重要な視覚的特徴だけを50単語以内で説明してください。
+            詳細な説明は避け、主要な活動や場面の特徴だけを端的に記述してください。
+            例: 「日本の都市部を歩いている様子」「オフィスでの会議の様子」など
+            """
             
             response = self.model.generate_content([prompt, img])
             
             if response.text:
-                logger.info("画像分析完了")
-                return response.text
+                # 返答が長すぎる場合は切り詰める
+                description = response.text.strip()
+                if len(description) > 100:
+                    description = description[:97] + "..."
+                logger.info("画像分析完了: 簡潔な説明を生成")
+                return description
             else:
                 logger.warning("画像分析結果が空です")
                 return "説明を生成できませんでした"
@@ -364,3 +395,184 @@ class GeminiClient:
         except Exception as e:
             logger.error(f"シーン分析中にエラーが発生: {str(e)}")
             return None
+            
+    def analyze_scene_context(self, transcript: str, keyframe_path: str = None) -> dict:
+        """シーンの文脈をAIを用いて分析する"""
+        try:
+            prompt = f"""
+            以下のトランスクリプトを分析し、シーンについて次の情報を提供してください：
+            - location_type（屋内/屋外/交通機関内など）
+            - estimated_time_of_day（朝/昼/夜など）
+            - weather_conditions（天候の状態）
+            - key_activities（主要な活動）
+            - emotional_tone（感情トーン）
+            - narrative_purpose（シーンの物語上の目的）
+            
+            トランスクリプト: {transcript}
+            
+            JSONで回答してください。
+            """
+            
+            if keyframe_path and os.path.exists(keyframe_path):
+                response = self.model.generate_content([prompt, Image.open(keyframe_path)])
+            else:
+                response = self.model.generate_content(prompt)
+                
+            # レスポンスをパースしてJSON形式に変換
+            try:
+                analysis = json.loads(response.text)
+                return {
+                    "location_type": analysis.get("location_type", "不明"),
+                    "estimated_time_of_day": analysis.get("estimated_time_of_day", "不明"),
+                    "weather_conditions": analysis.get("weather_conditions", "不明"),
+                    "key_activities": analysis.get("key_activities", []),
+                    "emotional_tone": analysis.get("emotional_tone", "中立"),
+                    "narrative_purpose": analysis.get("narrative_purpose", "情報提供")
+                }
+            except json.JSONDecodeError:
+                logger.error("AIからの応答をJSONに変換できませんでした。テキスト形式で返します。")
+                return {
+                    "location_type": "不明",
+                    "estimated_time_of_day": "不明",
+                    "weather_conditions": "不明",
+                    "key_activities": [],
+                    "emotional_tone": "中立",
+                    "narrative_purpose": "情報提供",
+                    "ai_response": response.text
+                }
+                
+        except Exception as e:
+            logger.error(f"シーン文脈分析中にエラーが発生: {str(e)}")
+            return {
+                "location_type": "不明",
+                "estimated_time_of_day": "不明",
+                "weather_conditions": "不明",
+                "key_activities": [],
+                "emotional_tone": "中立",
+                "narrative_purpose": "情報提供"
+            }
+    
+    def generate_editing_suggestions(self, node_data: dict) -> dict:
+        """編集提案をAIを用いて生成する"""
+        try:
+            prompt = f"""
+            以下の情報からビデオ編集の提案を生成してください：
+            
+            トランスクリプト: {node_data.get('transcript', '')}
+            時間: {node_data.get('time_in', 0)}秒 から {node_data.get('time_out', 0)}秒
+            シーン分析: {json.dumps(node_data.get('context_analysis', {}), ensure_ascii=False)}
+            
+            以下の項目についてJSONで回答してください：
+            - highlight_worthy（このシーンがハイライトに値するか、true/false）
+            - potential_cutpoint（このシーンをカットすべきか、true/false）
+            - b_roll_opportunity（B-rollとして追加すべき映像の提案）
+            - audio_considerations（音声に関する考慮事項）
+            """
+            
+            response = self.model.generate_content(prompt)
+            
+            try:
+                suggestions = json.loads(response.text)
+                return {
+                    "highlight_worthy": suggestions.get("highlight_worthy", False),
+                    "potential_cutpoint": suggestions.get("potential_cutpoint", False),
+                    "b_roll_opportunity": suggestions.get("b_roll_opportunity", ""),
+                    "audio_considerations": suggestions.get("audio_considerations", "")
+                }
+            except json.JSONDecodeError:
+                logger.error("AIからの応答をJSONに変換できませんでした")
+                return {
+                    "highlight_worthy": False,
+                    "potential_cutpoint": False,
+                    "b_roll_opportunity": "",
+                    "audio_considerations": ""
+                }
+                
+        except Exception as e:
+            logger.error(f"編集提案生成中にエラーが発生: {str(e)}")
+            return {
+                "highlight_worthy": False,
+                "potential_cutpoint": False,
+                "b_roll_opportunity": "",
+                "audio_considerations": ""
+            }
+    
+    def generate_video_summary(self, transcripts: list, nodes: list) -> dict:
+        """動画全体の要約をAIを用いて生成する"""
+        try:
+            all_text = " ".join([t.get("text", "") for t in transcripts])
+            
+            # ノードから追加情報を抽出
+            activities = set()
+            emotions = set()
+            locations = set()
+            
+            for node in nodes:
+                if hasattr(node, 'context_analysis'):
+                    activities.update(node.context_analysis.get("key_activities", []))
+                    emotions.add(node.context_analysis.get("emotional_tone", ""))
+                    locations.add(node.context_analysis.get("location_type", ""))
+            
+            prompt = f"""
+            以下の情報から動画の要約を生成してください：
+            
+            トランスクリプト全文: {all_text}
+            
+            シーン数: {len(nodes)}
+            主な活動: {", ".join(activities)}
+            場所の種類: {", ".join(locations)}
+            感情トーン: {", ".join(emotions)}
+            
+            以下の項目についてJSONで回答してください：
+            - title（動画の端的なタイトル）
+            - overview（詳細な概要）
+            - topics（主要トピックリスト、配列）
+            - filming_date（撮影日、検出できる場合）
+            - location（撮影場所）
+            - weather（天候）
+            - purpose（動画の目的）
+            - transportation（移動手段、検出できる場合）
+            - starting_point（出発地点、検出できる場合）
+            - destination（目的地、検出できる場合）
+            """
+            
+            response = self.model.generate_content(prompt)
+            
+            try:
+                summary = json.loads(response.text)
+                
+                # VideoSummaryの形式に合わせる
+                return {
+                    "title": summary.get("title", "無題"),
+                    "overview": summary.get("overview", ""),
+                    "topics": summary.get("topics", []),
+                    "filming_date": summary.get("filming_date", ""),
+                    "location": summary.get("location", ""),
+                    "weather": summary.get("weather", "不明"),
+                    "purpose": summary.get("purpose", ""),
+                    "transportation": summary.get("transportation", "不明"),
+                    "starting_point": summary.get("starting_point", ""),
+                    "destination": summary.get("destination", ""),
+                    "scene_count": len(nodes),
+                    "total_duration": nodes[-1].time_out if nodes else 0,
+                    "gopro_start_time": ""  # このデータはAIでは生成できない
+                }
+            except json.JSONDecodeError:
+                logger.error("AIからの応答をJSONに変換できませんでした")
+                return {
+                    "title": "要約生成エラー",
+                    "overview": "AI要約の生成中にエラーが発生しました",
+                    "topics": [],
+                    "scene_count": len(nodes),
+                    "total_duration": nodes[-1].time_out if nodes else 0
+                }
+                
+        except Exception as e:
+            logger.error(f"動画要約生成中にエラーが発生: {str(e)}")
+            return {
+                "title": "要約生成エラー",
+                "overview": f"エラー: {str(e)}",
+                "topics": [],
+                "scene_count": len(nodes),
+                "total_duration": nodes[-1].time_out if nodes else 0
+            }

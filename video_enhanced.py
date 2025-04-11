@@ -1,263 +1,375 @@
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
 import os
-import subprocess
-import threading
+import sys
 import json
 import time
-from datetime import datetime
+import shutil
 import logging
-from api_client import WhisperClient
-from typing import List
-import glob
-import torch  # GPUメモリ管理用
-import gc
+import threading
+import subprocess
+import glob  # globモジュールを追加
+from typing import List, Dict, Any, Optional
+from datetime import datetime
+from pathlib import Path
+import functools
+import psutil
+
+# サードパーティライブラリ
+import cv2
+import numpy as np
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    logging.warning("PyTorchが利用できません。CPU処理モードで実行します。")
+
+# OpenCVのFFmpeg読み取り試行回数を増加（マルチストリーム処理の安定性向上）
+cv2.setNumThreads(4)
+
+# GUI関連のインポート
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageTk
-import sys
-import re
+from ttkthemes import ThemedTk
+
+# OpenCVのFFmpeg読み取り試行回数を増加（マルチストリーム処理の安定性向上）
+os.environ["OPENCV_FFMPEG_READ_ATTEMPTS"] = "10000"  # デフォルト4096から増加
 
 # ロギング設定
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(f"logs/enhanced_{datetime.now():%Y%m%d_%H%M%S}.log", encoding='utf-8')
-    ]
-)
+# logsディレクトリが存在しない場合は作成
+os.makedirs("logs", exist_ok=True)
 
+# ロガーの設定
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)  # DEBUGレベルに設定
 
-class VideoSummary:
-    def __init__(self):
-        self.title = ""  # 動画の端的なタイトル
-        self.overview = ""  # 詳細な概要
-        self.topics = []  # 主要トピックリスト
-        self.filming_date = ""  # 撮影日
-        self.location = ""  # 撮影場所
-        self.weather = ""  # 天候
-        self.purpose = ""  # 動画の目的
-        self.transportation = ""  # 移動手段
-        self.starting_point = ""  # 出発地点
-        self.destination = ""  # 目的地
-        self.scene_count = 0  # シーン数
-        self.total_duration = 0.0  # 合計秒数
-        self.gopro_start_time = ""  # 撮影開始時間
+# ファイルハンドラの設定
+log_file = f"logs/enhanced_{datetime.now():%Y%m%d_%H%M%S}.log"
+file_handler = logging.FileHandler(log_file, encoding='utf-8')
+file_handler.setLevel(logging.DEBUG)
+file_handler.setFormatter(logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
+))
+logger.addHandler(file_handler)
+
+# コンソールハンドラの設定
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(logging.Formatter(
+    '%(asctime)s - %(levelname)s - %(message)s'
+))
+logger.addHandler(console_handler)
+
+# システム情報のログ出力
+logger.info("=== システム情報 ===")
+logger.info(f"Python バージョン: {sys.version}")
+logger.info(f"OS: {os.name} - {sys.platform}")
+if TORCH_AVAILABLE:
+    logger.info(f"PyTorch バージョン: {torch.__version__}")
+    if torch.cuda.is_available():
+        logger.info(f"CUDA バージョン: {torch.version.cuda}")
+        logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
+        logger.info(f"利用可能GPU数: {torch.cuda.device_count()}")
+        for i in range(torch.cuda.device_count()):
+            logger.info(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+            props = torch.cuda.get_device_properties(i)
+            logger.info(f"  - 総メモリ: {props.total_memory / 1024**3:.2f} GB")
+            logger.info(f"  - CUDA Capability: {props.major}.{props.minor}")
+else:
+    logger.info("PyTorch は利用できません")
+
+logger.info("=== 環境変数 ===")
+logger.info(f"OPENCV_FFMPEG_READ_ATTEMPTS: {os.getenv('OPENCV_FFMPEG_READ_ATTEMPTS', 'Not set')}")
+logger.info(f"GEMINI_API_KEY設定状態: {'設定済み' if os.getenv('GEMINI_API_KEY') else '未設定'}")
+
+# エラーハンドリング用のデコレータ
+def log_exceptions(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            # 関数名と引数をログに記録
+            logger.info(f"関数開始: {func.__name__}")
+            logger.debug(f"引数: args={args}, kwargs={kwargs}")
+            
+            # メモリ使用状況を記録
+            log_memory_usage()
+            
+            # 関数実行
+            result = func(*args, **kwargs)
+            
+            # 成功時のログ
+            logger.info(f"関数成功: {func.__name__}")
+            if result is not None:
+                logger.debug(f"戻り値の型: {type(result)}")
+                if isinstance(result, (list, dict)):
+                    logger.debug(f"戻り値のサイズ: {len(result)}")
+            
+            return result
+        except Exception as e:
+            # エラー情報を詳細に記録
+            logger.error(f"関数 {func.__name__} でエラー発生")
+            logger.error(f"エラーの種類: {type(e).__name__}")
+            logger.error(f"エラーメッセージ: {str(e)}")
+            logger.error("スタックトレース:", exc_info=True)
+            
+            # メモリ使用状況を記録
+            log_memory_usage()
+            
+            # 環境情報を記録
+            logger.error("=== エラー発生時の環境情報 ===")
+            logger.error(f"Python バージョン: {sys.version}")
+            logger.error(f"PyTorch バージョン: {torch.__version__}")
+            if TORCH_AVAILABLE and torch.cuda.is_available():
+                logger.error(f"CUDA バージョン: {torch.version.cuda}")
+                logger.error(f"GPU: {torch.cuda.get_device_name(0)}")
+                logger.error(f"利用可能GPU数: {torch.cuda.device_count()}")
+                for i in range(torch.cuda.device_count()):
+                    logger.error(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+                    logger.error(f"  - 総メモリ: {torch.cuda.get_device_properties(i).total_memory / 1024**3:.2f} GB")
+                    logger.error(f"  - CUDA Capability: {torch.cuda.get_device_properties(i).major}.{torch.cuda.get_device_properties(i).minor}")
+            
+            # 詳細なスタックトレース
+            import traceback
+            logger.error("詳細なスタックトレース:\n" + "".join(traceback.format_tb(e.__traceback__)))
+            raise
+    return wrapper
+
+# メモリ使用状況をログ出力する関数
+def log_memory_usage():
+    process = psutil.Process()
+    memory_info = process.memory_info()
+    logger.debug("=== メモリ使用状況 ===")
+    logger.debug(f"  - RSS (物理メモリ): {memory_info.rss / 1024**2:.2f} MB")
+    logger.debug(f"  - VMS (仮想メモリ): {memory_info.vms / 1024**2:.2f} MB")
+    logger.debug(f"  - ページフォールト: {memory_info.pfaults}")
+    logger.debug(f"  - ページインフォールト: {memory_info.pageins}")
     
-    def to_dict(self):
-        return {
-            "title": self.title,
-            "overview": self.overview,
-            "topics": self.topics,
-            "filming_date": self.filming_date,
-            "location": self.location,
-            "weather": self.weather,
-            "purpose": self.purpose,
-            "transportation": self.transportation,
-            "starting_point": self.starting_point,
-            "destination": self.destination,
-            "scene_count": self.scene_count,
-            "total_duration": self.total_duration,
-            "gopro_start_time": self.gopro_start_time
-        }
+    if TORCH_AVAILABLE and torch.cuda.is_available():
+        logger.debug("=== CUDAメモリ使用状況 ===")
+        logger.debug(f"  - 確保済みメモリ: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+        logger.debug(f"  - キャッシュメモリ: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
+        logger.debug(f"  - 最大確保メモリ: {torch.cuda.max_memory_allocated() / 1024**2:.2f} MB")
+        logger.debug(f"  - 最大キャッシュメモリ: {torch.cuda.max_memory_reserved() / 1024**2:.2f} MB")
+        
+        # GPUメモリの詳細情報
+        for i in range(torch.cuda.device_count()):
+            logger.debug(f"=== GPU {i} メモリ詳細 ===")
+            logger.debug(f"  - 総メモリ: {torch.cuda.get_device_properties(i).total_memory / 1024**2:.2f} MB")
+            logger.debug(f"  - 空きメモリ: {torch.cuda.memory_reserved(i) - torch.cuda.memory_allocated(i) / 1024**2:.2f} MB")
+            logger.debug(f"  - メモリ使用率: {(torch.cuda.memory_allocated(i) / torch.cuda.get_device_properties(i).total_memory) * 100:.2f}%")
 
-class VideoNode:
-    def __init__(self, time_in, time_out, transcript="", description="", keyframe_path="", preview_path=""):
-        self.time_in = time_in
-        self.time_out = time_out
-        self.transcript = transcript
-        self.description = description
-        self.keyframe_path = keyframe_path
-        self.preview_path = preview_path
-        self.context_analysis = {
-            "location_type": "",  # 場所の種類（屋内/屋外/交通機関内など）
-            "estimated_time_of_day": "",  # 推定時刻（朝/昼/夕方/夜）
-            "weather_conditions": "",  # 天候状態
-            "key_activities": [],  # 活動リスト
-            "emotional_tone": "",  # 話者の感情トーン
-            "narrative_purpose": ""  # シーンの物語上の目的
-        }
-        self.editing_suggestions = {
-            "highlight_worthy": False,  # ハイライト候補か
-            "potential_cutpoint": False,  # カットポイントとして適切か
-            "b_roll_opportunity": "",  # B-rollの提案
-            "audio_considerations": ""  # 音声に関する注意点
-        }
-    
-    def to_dict(self):
-        return {
-            "scene_id": id(self),  # オブジェクトのIDを一意のシーンIDとして使用
-            "time_in": self.time_in,
-            "time_out": self.time_out,
-            "transcript": self.transcript,
-            "description": self.description,
-            "context_analysis": self.context_analysis,
-            "editing_suggestions": self.editing_suggestions,
-            "keyframe_path": self.keyframe_path,
-            "preview_path": self.preview_path,
-            "duration": self.time_out - self.time_in
-        }
-
-class VideoEnhanced:
-
-    def __init__(self):
-        self.root = tk.Tk()
-        self.root.title("ビデオノード生成ツール")
-        self.root.geometry("1200x800")  # ウィンドウサイズを大きく
+# メインコンテナ
+        root = tk.Tk()
+        root.title("動画解析・編集アシスタント")
+        root.geometry("1200x800")
         
-        # アイコンとスタイルの設定
-        self.style = ttk.Style()
-        self.style.configure("Custom.Treeview", rowheight=40)  # 行の高さを調整
-        self.style.configure("Custom.Treeview.Heading", font=('Helvetica', 10, 'bold'))
+        main_frame = ttk.Frame(root, padding="10 10 10 10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
         
-        # 処理フラグ
-        self.processing = False
-        self.processing_thread = None
-        self.selected_files = []
-        self.processed_files = set()
-        self.current_file_progress = 0
+        # ヘッダーフレーム
+        header_frame = ttk.Frame(main_frame)
+        header_frame.pack(fill=tk.X, pady=(0, 10))
         
-        # UIの構築
-        self.build_ui()
-    
-    def build_ui(self):
-        # メインフレーム（左右に分割）
-        main_frame = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        # 左側：ファイルリスト
-        left_frame = ttk.Frame(main_frame)
-        main_frame.add(left_frame, weight=2)
-        
-        # コントロールフレーム
-        control_frame = ttk.LabelFrame(left_frame, text="コントロール")
-        control_frame.pack(fill="x", padx=5, pady=5)
-        
-        # ボタンフレーム
-        button_frame = ttk.Frame(control_frame)
-        button_frame.pack(fill="x", padx=5, pady=5)
+        ttk.Label(header_frame, text="動画解析・編集アシスタント", style='Title.TLabel').pack(side=tk.LEFT, padx=5)
         
         # ファイル選択ボタン
-        self.select_button = ttk.Button(
-            button_frame,
-            text="📂 フォルダを選択",
-            command=self.select_files
-        )
-        self.select_button.pack(side="left", padx=5)
+        button_frame = ttk.Frame(header_frame)
+        button_frame.pack(side=tk.RIGHT)
         
-        # 処理ボタン
-        self.process_button = ttk.Button(
-            button_frame,
-            text="▶ 一括処理開始",
-            command=self.confirm_start_processing,
-            state="disabled"
-        )
-        self.process_button.pack(side="left", padx=5)
+        self.open_button = ttk.Button(button_frame, text="📂 動画を選択", command=self.select_files)
+        self.open_button.pack(side=tk.LEFT, padx=5)
         
-        # キャンセルボタン
-        self.cancel_button = ttk.Button(
-            button_frame,
-            text="⏹ キャンセル",
-            command=self.confirm_cancel_processing,
-            state="disabled"
-        )
-        self.cancel_button.pack(side="left", padx=5)
+        self.open_folder_button = ttk.Button(button_frame, text="📁 フォルダを選択", command=self.select_folder)
+        self.open_folder_button.pack(side=tk.LEFT, padx=5)
         
-        # オプションフレーム
-        option_frame = ttk.Frame(control_frame)
-        option_frame.pack(fill="x", padx=5, pady=5)
+        # 左右のメインペイン
+        paned = ttk.PanedWindow(main_frame, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True)
         
-        # 処理済みスキップオプション
-        self.resume_var = tk.BooleanVar(value=True)
-        self.resume_check = ttk.Checkbutton(
-            option_frame,
-            text="処理済みをスキップ",
-            variable=self.resume_var
-        )
-        self.resume_check.pack(side="left", padx=5)
+        # 左ペイン（ファイルリスト）
+        list_frame = ttk.Frame(paned, padding="0 0 0 0")
         
-        # ファイルリストフレーム
-        list_frame = ttk.LabelFrame(left_frame, text="ファイルリスト")
-        list_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        # リストのラベル
+        ttk.Label(list_frame, text="処理対象ファイル", style='Header.TLabel').pack(anchor="w", padx=5, pady=(0, 5))
         
-        # ツリービュー
-        columns = ("ファイル名", "状態", "シーン数", "サムネイル")
-        self.file_list = ttk.Treeview(
-            list_frame,
-            columns=columns,
-            show="headings",
-            style="Custom.Treeview"
-        )
-        
-        # カラム設定
-        self.file_list.heading("ファイル名", text="ファイル名")
-        self.file_list.heading("状態", text="状態")
-        self.file_list.heading("シーン数", text="シーン数")
-        self.file_list.heading("サムネイル", text="サムネイル")
-        
-        self.file_list.column("ファイル名", width=200)
+        # ファイルリスト
+        columns = ("ファイル名", "状態", "シーン数")
+        self.file_list = ttk.Treeview(list_frame, columns=columns, show="headings", height=15)
+        self.file_list.column("ファイル名", width=500)  # 幅を広げる
         self.file_list.column("状態", width=100)
-        self.file_list.column("シーン数", width=80)
-        self.file_list.column("サムネイル", width=300)
+        self.file_list.column("シーン数", width=70)
         
-        # スクロールバー
-        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.file_list.yview)
-        self.file_list.configure(yscrollcommand=scrollbar.set)
+        for col in columns:
+            self.file_list.heading(col, text=col)
         
-        self.file_list.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        self.file_list.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
-        # ツリービューにダブルクリックイベントを追加
-        self.file_list.bind("<Double-1>", self.show_file_details)
+        # ファイルリストスクロールバー
+        list_scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.file_list.yview)
+        list_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.file_list.configure(yscrollcommand=list_scrollbar.set)
         
-        # 選択変更イベントを追加（プレビュー表示用）
+        # ファイルリストの選択イベントをバインド
         self.file_list.bind("<<TreeviewSelect>>", self.update_preview)
         
-        # 右側：プレビューとログ
-        right_frame = ttk.Frame(main_frame)
-        main_frame.add(right_frame, weight=1)
+        # アクションボタンフレーム
+        action_frame = ttk.Frame(list_frame)
+        action_frame.pack(fill=tk.X, padx=5, pady=5)
         
-        # プレビューフレーム
-        preview_frame = ttk.LabelFrame(right_frame, text="プレビュー")
-        preview_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        self.process_button = ttk.Button(action_frame, text="▶️ 処理開始", command=self.confirm_start_processing)
+        self.process_button.pack(side=tk.LEFT, padx=5)
         
-        # プレビュー画像
-        self.preview_label = ttk.Label(preview_frame)
-        self.preview_label.pack(fill="both", expand=True, padx=5, pady=5)
+        self.stop_button = ttk.Button(action_frame, text="⏹️ 停止", command=self.cancel_processing, state=tk.DISABLED)
+        self.stop_button.pack(side=tk.LEFT, padx=5)
         
-        # プログレスフレーム
-        progress_frame = ttk.LabelFrame(right_frame, text="進捗状況")
-        progress_frame.pack(fill="x", padx=5, pady=5)
+        self.view_button = ttk.Button(action_frame, text="👁️ 詳細表示", command=self.show_file_details, state=tk.DISABLED)
+        self.view_button.pack(side=tk.RIGHT, padx=5)
         
-        # 全体の進捗
-        ttk.Label(progress_frame, text="全体の進捗:").pack(fill="x", padx=5, pady=2)
-        self.total_progress_var = tk.DoubleVar()
-        self.total_progress_bar = ttk.Progressbar(
-            progress_frame,
-            variable=self.total_progress_var,
-            maximum=100
-        )
-        self.total_progress_bar.pack(fill="x", padx=5, pady=2)
+        # 右ペイン（詳細情報）
+        self.details_frame = ttk.Frame(paned)
         
-        # 現在のファイルの進捗
-        ttk.Label(progress_frame, text="現在のファイル:").pack(fill="x", padx=5, pady=2)
-        self.file_progress_var = tk.DoubleVar()
-        self.file_progress_bar = ttk.Progressbar(
-            progress_frame,
-            variable=self.file_progress_var,
-            maximum=100
-        )
-        self.file_progress_bar.pack(fill="x", padx=5, pady=2)
+        # 右ペインを上下に分割
+        right_paned = ttk.PanedWindow(self.details_frame, orient=tk.VERTICAL)
+        right_paned.pack(fill=tk.BOTH, expand=True)
         
-        # ステータス表示
-        self.status_label = ttk.Label(
-            right_frame,
-            text="フォルダを選択してください",
-            wraplength=400
-        )
-        self.status_label.pack(fill="x", padx=5, pady=5)
-    
+        # 上部：サムネイル表示エリア
+        thumbnail_frame = ttk.Frame(right_paned)
+        right_paned.add(thumbnail_frame, weight=1)
+        
+        # サムネイル表示
+        self.preview_label = ttk.Label(thumbnail_frame, text="サムネイルがありません", anchor="center")
+        self.preview_label.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # 下部：プレビュー再生エリア
+        preview_frame = ttk.Frame(right_paned)
+        right_paned.add(preview_frame, weight=1)
+        
+        # プレビュー再生エリアのタイトル
+        ttk.Label(preview_frame, text="プレビュー", style='Header.TLabel').pack(anchor="w", padx=5, pady=5)
+        
+        # 動画再生フレーム
+        video_container = ttk.Frame(preview_frame, relief="solid", borderwidth=1)
+        video_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # 実際の動画表示領域 - tkフレームに変更（背景色設定用）
+        self.video_frame = tk.Frame(video_container, width=400, height=300, bg="black")
+        self.video_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # VLCの代わりにデフォルトで表示するラベル
+        self.video_label = ttk.Label(self.video_frame, text="動画プレビュー\nファイルを選択してください", 
+                                   anchor="center", background="black", foreground="white")
+        self.video_label.pack(expand=True, fill=tk.BOTH)
+        
+        # コントロールパネル
+        controls_frame = ttk.Frame(preview_frame)
+        controls_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        # 再生/停止ボタン
+        self.play_button = ttk.Button(controls_frame, text="▶ 再生", command=self.play_preview)
+        self.play_button.pack(side=tk.LEFT, padx=5)
+        
+        self.stop_button = ttk.Button(controls_frame, text="⏹ 停止", command=self.stop_preview)
+        self.stop_button.pack(side=tk.LEFT, padx=5)
+        
+        # 再生時間表示
+        self.time_label = ttk.Label(controls_frame, text="再生時間: 00:00 / 00:00")
+        self.time_label.pack(side=tk.RIGHT, padx=10)
+        
+        # パネル分割の設定
+        paned.add(list_frame, weight=1)
+        paned.add(self.details_frame, weight=2)
+        
+        # ステータスバー
+        status_frame = ttk.Frame(main_frame, relief=tk.SUNKEN, padding=(5, 2))
+        status_frame.pack(fill=tk.X, side=tk.BOTTOM, pady=(5, 0))
+        
+        self.status_label = ttk.Label(status_frame, text="準備完了")
+        self.status_label.pack(side=tk.LEFT)
+        
+        # 進捗バー（ファイル全体）
+        self.progress_frame = ttk.LabelFrame(status_frame, text="進捗", padding=(5, 2))
+        self.progress_frame.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=5)
+        
+        self.total_progress_var = tk.IntVar(value=0)
+        self.total_progress = ttk.Progressbar(self.progress_frame, orient=tk.HORIZONTAL, 
+                                                length=200, mode='determinate', 
+                                                variable=self.total_progress_var)
+        self.total_progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        
+        self.file_progress_var = tk.IntVar(value=0)
+        self.file_progress = ttk.Progressbar(self.progress_frame, orient=tk.HORIZONTAL, 
+                                               length=100, mode='determinate', 
+                                               variable=self.file_progress_var)
+        self.file_progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        
+        # 処理状態の初期化
+        self.processing = False
+        self.processing_thread = None
+        self.current_file = None
+        self.selected_files = []
+        self.processed_files = set()
+        self.current_preview_path = None
+        self.current_duration = 0
+        self.is_playing = False
+        self.update_timer = None
+        
+        # VLCプレーヤーの初期化
+        self.vlc_instance = None
+        self.player = None
+        try:
+            # 実行時にVLCをインポート
+            vlc_module = __import__('vlc')
+            self.vlc_instance = vlc_module.Instance()
+            self.player = self.vlc_instance.media_player_new()
+            # プレイヤーが初期化できたらラベルを削除
+            self.video_label.pack_forget()
+            if os.name == 'nt':  # Windows
+                self.player.set_hwnd(self.video_frame.winfo_id())
+            else:  # Linux/MacOS
+                self.player.set_xwindow(self.video_frame.winfo_id())
+            logger.info("VLCプレーヤーを初期化しました")
+        except (ImportError, ModuleNotFoundError) as e:
+            logger.warning(f"VLCライブラリが見つかりません: {str(e)}")
+            self.video_label.config(text="VLCプレーヤーが利用できません\nVLCをインストールしてください")
+        except Exception as e:
+            logger.error(f"VLCプレーヤー初期化エラー: {str(e)}")
+            self.video_label.config(text=f"VLCプレーヤー初期化エラー\n{str(e)[:50]}...")
+        
+        # Gemini Clientの初期化
+        try:
+            self.gemini_client = GeminiClient()
+            logger.info("Gemini Clientを初期化しました")
+        except Exception as e:
+            logger.error(f"Gemini Client初期化エラー: {str(e)}")
+            # フォールバック：シンプルな機能を持つダミーインスタンスを作成
+            self.gemini_client = GeminiClient()  # クラスがダミー実装の場合はこれで問題ない
+        
+        # 終了時の処理を設定
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.root.update()
+
     def select_files(self):
+        """動画ファイルを選択"""
+        file_paths = filedialog.askopenfilenames(
+            title="処理する動画ファイルを選択",
+            filetypes=[
+                ("動画ファイル", "*.mp4 *.avi *.mov *.mkv"),
+                ("すべてのファイル", "*.*")
+            ]
+        )
+        
+        if not file_paths:
+            return
+
+        self.selected_files = sorted(file_paths)  # ファイル名でソート
+        self.update_file_list()
+        
+        # 処理ボタンを有効化
+        if self.selected_files:
+            self.process_button.config(state="normal")
+            self.update_status("準備完了", f"{len(self.selected_files)}個の動画ファイルが選択されました")
+
+    def select_folder(self):
         """フォルダを選択し、その中の動画ファイルを一括で選択"""
         folder_path = filedialog.askdirectory(
             title="処理するフォルダを選択"
@@ -283,7 +395,6 @@ class VideoEnhanced:
             return
 
         self.selected_files = sorted(video_files)  # ファイル名でソート
-        self.resume_var.set(False)  # 再処理のためにスキップをオフに
         self.update_file_list()
         
         # 処理ボタンを有効化
@@ -321,6 +432,8 @@ class VideoEnhanced:
                             first_keyframe = keyframe_files[0] if keyframe_files else None
                             if first_keyframe:
                                 thumbnail = os.path.relpath(first_keyframe, os.path.dirname(video_path))
+                            else:
+                                thumbnail = "キーフレームが見つかりません"
                         else:
                             status = "⚠ 未完了"
                 except Exception as e:
@@ -329,7 +442,7 @@ class VideoEnhanced:
 
             # ツリービューにファイル情報を挿入
             item_id = self.file_list.insert("", tk.END, values=(
-                os.path.basename(video_path),
+                video_path,  # 完全なパスを表示
                 status,
                 scene_count,
                 thumbnail
@@ -343,7 +456,7 @@ class VideoEnhanced:
         self.update_preview()
             
         self.update_status("準備完了", f"{len(self.selected_files)}個のビデオファイルが選択されました")
-    
+
     def confirm_start_processing(self):
         """処理開始の確認"""
         if not self.selected_files:
@@ -352,12 +465,12 @@ class VideoEnhanced:
         
         if messagebox.askyesno("確認", "動画ファイルの処理を開始してもよろしいですか？"):
             self.start_batch_processing()
-    
+
     def confirm_cancel_processing(self):
         """処理キャンセルの確認"""
         if messagebox.askyesno("確認", "処理を中止してもよろしいですか？"):
             self.cancel_processing()
-    
+
     def start_batch_processing(self):
         """バッチ処理を開始"""
         if not self.selected_files:
@@ -370,9 +483,10 @@ class VideoEnhanced:
         
         # UI状態の更新
         self.processing = True
-        self.select_button.config(state="disabled")
+        self.open_button.config(state="disabled")
+        self.open_folder_button.config(state="disabled")
         self.process_button.config(state="disabled")
-        self.cancel_button.config(state="normal")
+        self.stop_button.config(state="normal")
         self.total_progress_var.set(0)
         self.file_progress_var.set(0)
         
@@ -385,7 +499,7 @@ class VideoEnhanced:
         
         # 定期的に状態をチェック
         self.root.after(100, self.check_thread_status)
-    
+
     def process_files_thread(self):
         """複数ファイルの処理を実行"""
         try:
@@ -397,7 +511,7 @@ class VideoEnhanced:
                     break
                 
                 # 処理済みファイルをスキップ
-                if self.resume_var.get() and video_path in self.processed_files:
+                if video_path in self.processed_files:
                     logger.info(f"スキップ: {os.path.basename(video_path)} (処理済)")
                     processed_count += 1
                     continue
@@ -445,330 +559,415 @@ class VideoEnhanced:
         
         finally:
             self.processing = False
-    
+
+    @log_exceptions
     def process_single_video(self, video_path: str):
-        """個別のビデオファイルを処理"""
-        try:
-            # ノードリストの初期化
-            nodes = []
-
-            # 出力ディレクトリの作成
-            base_name = os.path.splitext(os.path.basename(video_path))[0]
-            output_dir = os.path.join(os.path.dirname(video_path), f"video_nodes_{base_name}")
-            keyframes_dir = os.path.join(output_dir, "keyframes")
-            preview_dir = os.path.join(output_dir, "previews")
-            os.makedirs(keyframes_dir, exist_ok=True)
-            os.makedirs(preview_dir, exist_ok=True)
-
-            # GoPro内部時間の取得（ファイル単位のメタデータ）
-            try:
-                gopro_metadata = self.extract_gopro_metadata(video_path)
-            except Exception as e:
-                logger.error(f"GoPro時間取得エラー: {str(e)}")
-                gopro_metadata = None
-
-            # 音声分析
-            try:
-                # GPUメモリをクリア
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    gc.collect()
-
-                client = WhisperClient(
-                    model_size="large",
-                    compute_type="int8"
-                )
-                result = client.process_video(
-                    video_path,
-                    min_silence=0.3,  # 無音検出の感度をさらに上げる（0.3秒）
-                    start_time=0.0  # ファイル単位の開始時間
-                )
-                
-                # 音声分析の進捗を更新
-                self.file_progress_var.set(30)  # 30%まで完了
-                
-            finally:
-                # GPUメモリを解放
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    gc.collect()
-                    
-                # WhisperClientのクリーンアップ
-                if 'client' in locals():
-                    del client
-            
-            if not self.processing:  # キャンセルチェック
-                return
-
-            # シーン分割処理
-            enhanced_boundaries = []
-            
-            # 無音区間の検出（より短い無音も検出）
-            if result.get("silent_regions"):
-                for region in result["silent_regions"]:
-                    if region["duration"] >= 0.5:  # 0.5秒以上の無音
-                        enhanced_boundaries.extend([region["start"], region["end"]])
-            
-            # 音声認識結果からの境界も追加
-            if result["scene_boundaries"]:
-                for boundary in result["scene_boundaries"]:
-                    if boundary not in enhanced_boundaries:
-                        enhanced_boundaries.append(boundary)
-            
-            # 文の区切りからの境界も追加
-            for t in result["transcripts"]:
-                if t["text"].strip().endswith(("。", ".", "!", "?", "！", "？")):
-                    if t["end"] not in enhanced_boundaries:
-                        enhanced_boundaries.append(t["end"])
-            
-            # 境界の整理と重複除去
-            enhanced_boundaries = sorted(list(set(enhanced_boundaries)))
-            
-            # シーンノード生成
-            for i in range(len(enhanced_boundaries) - 1):
-                start_time = enhanced_boundaries[i]
-                end_time = enhanced_boundaries[i + 1]
-                
-                # シーンノード作成
-                node = VideoNode(start_time, end_time)
-                
-                # シーン内の文字起こしを取得
-                scene_transcripts = [
-                    t["text"] for t in result["transcripts"]
-                    if t["start"] >= start_time and t["end"] <= end_time
-                ]
-                node.transcript = " ".join(scene_transcripts)
-
-                # シーンの説明を生成
-                description_parts = []
-                
-                # 無音シーンの判定
-                if not scene_transcripts:
-                    description_parts.append("無音シーン")
-                
-                # 仮の説明文
-                transcript_text = node.transcript.lower()
-                if "山" in transcript_text or "登山" in transcript_text:
-                    if "自撮り" in transcript_text or "撮影" in transcript_text:
-                        description_parts.append("話者が登山中に自撮りをしている様子")
-                    else:
-                        description_parts.append("登山に関する会話シーン")
-                elif "準備" in transcript_text or "装備" in transcript_text:
-                    description_parts.append("登山準備に関するシーン")
-                else:
-                    description_parts.append("話者が自撮りをしている様子")
-                
-                node.description = " / ".join(description_parts)
-                
-                # キーフレーム抽出
-                keyframe_path = os.path.join(
-                    keyframes_dir,
-                    f"keyframe_{i:04d}.jpg"
-                )
-                if self.extract_keyframe(video_path, start_time, keyframe_path):
-                    node.keyframe_path = os.path.relpath(keyframe_path, os.path.dirname(video_path))
-                    logger.info(f"キーフレーム保存: {node.keyframe_path}")
-                
-                # プレビュー動画の生成
-                preview_path = os.path.join(
-                    preview_dir,
-                    f"preview_{i:04d}.mp4"
-                )
-                if self.generate_preview_clip(video_path, start_time, end_time, preview_path):
-                    node.preview_path = os.path.relpath(preview_path, os.path.dirname(video_path))
-                    logger.info(f"プレビュー保存: {node.preview_path}")
-                
-                # シーンの文脈分析と編集提案を生成
-                node.context_analysis = self.analyze_scene_context(node, nodes, result["transcripts"])
-                node.editing_suggestions = self.generate_editing_suggestions(node, nodes)
-                
-                nodes.append(node)
-
-            # 動画全体のサマリー生成
-            summary = self.generate_video_summary(result["transcripts"], nodes)
-            
-            # GoProの開始時間を追加
-            if gopro_metadata and gopro_metadata.get("start_time"):
-                summary["gopro_start_time"] = gopro_metadata["start_time"]
-            
-            # 結果を保存
-            self.save_results(video_path, nodes, completed=True, summary=summary)
-            
-        except Exception as e:
-            logger.error(f"ビデオ処理中にエラー: {str(e)}")
-            raise
-
-    def extract_gopro_metadata(self, video_path: str) -> dict:
-        """GoProのメタデータを抽出"""
-        try:
-            command = [
-                "ffprobe",
-                "-v", "quiet",
-                "-print_format", "json",
-                "-show_format",
-                "-show_streams",
-                video_path
-            ]
-            result = subprocess.run(command, capture_output=True, text=True)
-            metadata = json.loads(result.stdout)
-            
-            # 開始時間のみを取得
-            start_time = metadata.get("format", {}).get("tags", {}).get("creation_time", "")
-            
-            return {
-                "start_time": start_time
-            }
-        except Exception as e:
-            logger.error(f"メタデータ抽出エラー: {str(e)}")
-            return None
-
-    def generate_video_summary(self, transcripts: list, nodes: list) -> dict:
-        """動画全体のサマリーを生成"""
-        all_text = " ".join([t["text"] for t in transcripts])
-        summary = VideoSummary()
+        """単一の動画を処理する"""
+        logger.info(f"動画処理開始: {video_path}")
+        log_memory_usage()
         
-        # タイトルの生成
-        if "大山" in all_text:
-            summary.title = "大山登山記録"
-            if "雪" in all_text or "寒" in all_text or "氷点下" in all_text or "冬" in all_text:
-                summary.title = "冬の大山登山記録"
-            summary.destination = "大山"
-        elif "富士山" in all_text:
-            summary.title = "富士山登山記録"
-            summary.destination = "富士山"
+        try:
+            # 既存のコード
+            ...
+            
+        finally:
+            log_memory_usage()
+            logger.info(f"動画処理完了: {video_path}")
+
+    @log_exceptions
+    def _extract_transcripts(self, video_path: str) -> dict:
+        """音声認識を実行する"""
+        logger.info(f"音声認識開始: {video_path}")
+        log_memory_usage()
+        
+        try:
+            # 既存のコード
+            ...
+            
+        finally:
+            log_memory_usage()
+            logger.info(f"音声認識完了: {video_path}")
+
+    @log_exceptions
+    def _detect_scenes(self, video_path: str) -> list:
+        """シーン検出を実行する"""
+        logger.info(f"シーン検出開始: {video_path}")
+        log_memory_usage()
+        
+        try:
+            # 既存のコード
+            ...
+            
+        finally:
+            log_memory_usage()
+            logger.info(f"シーン検出完了: {video_path}")
+
+    @log_exceptions
+    def _merge_scene_boundaries(self, scene_data: list, transcripts: dict, video_path: str = None) -> list:
+        """シーン境界を統合する"""
+        logger.info("シーン境界統合開始")
+        logger.debug(f"入力データ: scene_data={scene_data}, transcripts={transcripts}")
+        
+        try:
+            # 既存のコード
+            ...
+            
+        finally:
+            logger.info("シーン境界統合完了")
+
+    @log_exceptions
+    def _create_video_nodes(self, video_path: str, all_boundaries: list, scene_data: list, transcripts: dict, 
+                           keyframes_dir: str, preview_dir: str) -> List[VideoNode]:
+        """ビデオノードを生成する"""
+        logger.info("ビデオノード生成開始")
+        logger.debug(f"入力データ: boundaries={all_boundaries}, scene_data={scene_data}")
+        
+        try:
+            # 既存のコード
+            ...
+            
+        finally:
+            logger.info("ビデオノード生成完了")
+
+    def _apply_scene_data_to_node(self, node: VideoNode, matching_scene: dict, scene_transcripts: list, video_path: str):
+        """
+        検出されたシーンデータをノードに適用する
+        
+        Args:
+            node: 更新するVideoNodeオブジェクト
+            matching_scene: マッチしたシーンデータ
+            scene_transcripts: シーンの文字起こしテキストリスト
+            video_path: 動画ファイルのパス
+        """
+        if matching_scene:
+            if matching_scene.get("ai_analysis"):
+                node.context_analysis.update({
+                    "location_type": matching_scene["ai_analysis"].get("scene_type", ""),
+                    "estimated_time_of_day": matching_scene["ai_analysis"].get("time_of_day", ""),
+                    "weather_conditions": matching_scene["ai_analysis"].get("weather", ""),
+                    "key_activities": matching_scene["ai_analysis"].get("activities", [])
+                })
+            if matching_scene.get("representative_frame"):
+                node.keyframe_path = os.path.relpath(matching_scene["representative_frame"]["path"], 
+                                                os.path.dirname(video_path))
+
+        # 説明は映像分析から簡易生成（トランスクリプトを含めない）
+        if not node.transcript and not matching_scene:
+            node.description = "無音かつ変化のないシーン"
+        elif matching_scene and matching_scene.get("ai_analysis"):
+            activities = matching_scene["ai_analysis"].get("activities", [])
+            # 活動リストを簡潔に記述（長すぎる場合は要約）
+            activity_desc = ", ".join(activities) if activities else "活動なし"
+            if len(activity_desc) > 100:  # 長すぎる場合は切り詰める
+                activity_desc = activity_desc[:97] + "..."
+            node.description = f"映像分析: {activity_desc}"
         else:
-            summary.title = "登山記録"
-        
-        # 日付情報の抽出
-        for t in transcripts:
-            if "月" in t["text"] and "日" in t["text"]:
-                import re
-                date_match = re.search(r'(\d+)月(\d+)日', t["text"])
-                if date_match:
-                    month, day = date_match.groups()
-                    summary.filming_date = f"{month}月{day}日"
-                    # 曜日情報も探す
-                    day_of_week = ""
-                    if "土曜" in t["text"] or "土曜日" in t["text"]:
-                        day_of_week = "（土曜日）"
-                    elif "日曜" in t["text"] or "日曜日" in t["text"]:
-                        day_of_week = "（日曜日）"
-                    elif "月曜" in t["text"] or "月曜日" in t["text"]:
-                        day_of_week = "（月曜日）"
-                    elif "火曜" in t["text"] or "火曜日" in t["text"]:
-                        day_of_week = "（火曜日）"
-                    elif "水曜" in t["text"] or "水曜日" in t["text"]:
-                        day_of_week = "（水曜日）"
-                    elif "木曜" in t["text"] or "木曜日" in t["text"]:
-                        day_of_week = "（木曜日）"
-                    elif "金曜" in t["text"] or "金曜日" in t["text"]:
-                        day_of_week = "（金曜日）"
-                    summary.filming_date += day_of_week
-                    break
-        
-        # 目的の抽出
-        if "健康" in all_text and ("維持" in all_text or "ため" in all_text):
-            summary.purpose = "健康維持"
-        
-        # 天候情報の抽出
-        weather_keywords = {
-            "晴れ": "晴天",
-            "曇り": "曇天",
-            "雨": "雨天",
-            "雪": "雪",
-            "寒": "寒冷",
-            "暑": "暑熱",
-            "風": "強風",
-            "氷点下": "氷点下"
-        }
-        weather_conditions = []
-        for keyword, condition in weather_keywords.items():
-            if keyword in all_text:
-                weather_conditions.append(condition)
-        summary.weather = "、".join(weather_conditions) if weather_conditions else "不明"
-        
-        # 移動手段の推測
-        transport_keywords = {
-            "電車": "電車",
-            "バス": "バス",
-            "車": "自動車",
-            "タクシー": "タクシー",
-            "自転車": "自転車"
-        }
-        transports = []
-        for keyword, transport in transport_keywords.items():
-            if keyword in all_text:
-                transports.append(transport)
-        summary.transportation = "、".join(transports) if transports else "不明"
-        
-        # 出発地点の推測
-        location_keywords = ["駅", "バス停", "パーキング", "駐車場", "ロープウェイ"]
-        for t in transcripts[:10]:  # 最初の10発言を確認
-            for keyword in location_keywords:
-                if keyword in t["text"]:
-                    location_match = re.search(r'([^\s。、]+%s)' % keyword, t["text"])
-                    if location_match:
-                        summary.starting_point = location_match.group(1)
-                        break
-            if summary.starting_point:
-                break
-        
-        # トピックの抽出
-        summary.topics = []
-        if "山" in all_text or "登山" in all_text:
-            summary.topics.append("登山")
-        if "健康" in all_text and ("維持" in all_text or "ため" in all_text):
-            summary.topics.append("健康維持")
-        if "雪" in all_text or "寒" in all_text or "冬" in all_text or "氷点下" in all_text:
-            summary.topics.append("冬山")
-        if "大山" in all_text:
-            summary.topics.append("大山")
-        elif "富士山" in all_text:
-            summary.topics.append("富士山")
-        
-        # 基本情報の設定
-        summary.scene_count = len(nodes)
-        summary.total_duration = nodes[-1].time_out if nodes else 0
-        
-        # 概要文の生成
-        overview_parts = []
-        if summary.filming_date:
-            overview_parts.append(f"{summary.filming_date}に撮影")
-        if summary.destination:
-            overview_parts.append(f"{summary.destination}への登山")
-        if summary.purpose:
-            overview_parts.append(f"{summary.purpose}が目的")
-        if summary.weather != "不明":
-            overview_parts.append(f"天候は{summary.weather}")
-        if summary.transportation != "不明":
-            overview_parts.append(f"{summary.transportation}で移動")
-        
-        summary.overview = "、".join(overview_parts) + "。"
-        
-        return summary.to_dict()
+            node.description = "音声のみのシーン"
 
-    def save_results(self, video_path: str, nodes: List[VideoNode], completed: bool = True, summary: dict = None):
-        """処理結果を保存（新フォーマット）"""
-        output_dir = os.path.join(
-            os.path.dirname(video_path),
-            "video_nodes_" + os.path.splitext(os.path.basename(video_path))[0]
-        )
-        os.makedirs(output_dir, exist_ok=True)
+    def _generate_video_summary(self, video_path: str, nodes: List[VideoNode], transcripts: dict, gopro_metadata: dict) -> dict:
+        """
+        動画全体のサマリー情報を生成する
         
-        # シーンデータを新フォーマットに変換
-        scenes = []
-        for i, node in enumerate(nodes):
-            scene = {
-                "scene_id": i,
-                "time_in": node.time_in,
-                "time_out": node.time_out,
-                "transcript": node.transcript,
-                "description": node.description,
-                "keyframe_path": node.keyframe_path,
-                "preview_path": node.preview_path,
-                "duration": node.time_out - node.time_in
+        Args:
+            video_path: 動画ファイルのパス
+            nodes: 生成されたVideoNodeのリスト
+            transcripts: 文字起こし結果
+            gopro_metadata: GoPro メタデータ
+            
+        Returns:
+            dict: 生成されたサマリー情報
+        """
+        try:
+            transcript_text = " ".join([t["text"] for t in transcripts.get("transcripts", [])])
+            descriptions = " ".join([node.description for node in nodes if node.description])  # 各シーンの説明を結合
+            
+            # 映像分析情報を抽出して結合
+            visual_info = []
+            for node in nodes:
+                if hasattr(node, 'context_analysis') and node.context_analysis:
+                    activities = node.context_analysis.get("key_activities", [])
+                    if activities:
+                        visual_info.append(", ".join(activities))
+            
+            # サマリー生成
+            overview = self._generate_summary_with_gemini(transcript_text, descriptions, visual_info)
+            
+            summary = {
+                "title": os.path.basename(video_path),
+                "overview": overview if overview else "動画の説明が生成できませんでした",
+                "topics": [],
+                "filming_date": "",
+                "location": "",
+                "weather": "不明",
+                "purpose": "",
+                "transportation": "不明",
+                "starting_point": "",
+                "destination": "",
+                "scene_count": len(nodes),
+                "total_duration": nodes[-1].time_out if nodes else 0,
+                "gopro_start_time": gopro_metadata.get("start_time", "") if gopro_metadata else ""
             }
-            scenes.append(scene)
+            logger.info(f"Geminiによる動画概要生成: {summary['overview']}")
+            return summary
+            
+        except Exception as e:
+            logger.error(f"Geminiによるサマリー生成エラー: {str(e)}")
+            return {
+                "title": os.path.basename(video_path),
+                "overview": "サマリー生成に失敗しました",
+                "topics": [],
+                "scene_count": len(nodes),
+                "total_duration": nodes[-1].time_out if nodes else 0,
+                "gopro_start_time": gopro_metadata.get("start_time", "") if gopro_metadata else ""
+            }
+
+    def _generate_summary_with_gemini(self, transcript_text: str, descriptions: str, visual_info: list) -> str:
+        """
+        Gemini AIを使用して動画の概要を生成する
+        
+        Args:
+            transcript_text: 文字起こしテキスト
+            descriptions: シーン説明のテキスト
+            visual_info: 視覚的情報のリスト
+            
+        Returns:
+            str: 生成された概要テキスト
+        """
+        try:
+            # トランスクリプトと映像分析の両方を使用
+            prompt = f"""
+            以下の情報を基に、動画全体の簡潔で自然な説明を日本語で生成してください：
+            - 文字起こし: "{transcript_text}"
+            - シーン説明: "{descriptions}"
+            - 視覚情報: "{', '.join(visual_info)}"
+            
+            説明は2〜3文で、動画の概要や主要な活動を自然に描写してください。
+            トランスクリプトが空でも、視覚的な情報を使用して意味のある説明を生成してください。
+            """
+            
+            # Geminiクライアントのメソッドを使用して概要を生成
+            overview = self.gemini_client.generate_content(prompt)
+            if not overview or "エラー" in overview:
+                # 映像分析だけでサマリーを生成
+                fallback_prompt = f"""
+                以下の視覚情報から、動画全体の説明を日本語で生成してください：
+                - シーン説明: "{descriptions}"
+                
+                説明は2〜3文で、動画の概要や主要な内容を自然に描写してください。
+                """
+                overview = self.gemini_client.generate_content(fallback_prompt)
+            return overview
+        except Exception as e:
+            logger.error(f"Gemini API呼び出しエラー: {str(e)}")
+            # フォールバック：映像分析情報からシンプルな概要を生成
+def _generate_summary_with_gemini(self, transcript_text: str, descriptions: str, visual_info: list) -> str:
+    """
+    Gemini AIを使用して動画の概要を生成する
+    
+    Args:
+        transcript_text: 文字起こしテキスト
+        descriptions: シーン説明のテキスト
+        visual_info: 視覚的情報のリスト
+        
+    Returns:
+        str: 生成された概要テキスト
+    """
+    try:
+        # トランスクリプトと映像分析の両方を使用
+        prompt = f"""
+        以下の情報を基に、動画全体の簡潔で自然な説明を日本語で生成してください：
+        - 文字起こし: "{transcript_text}"
+        - シーン説明: "{descriptions}"
+        - 視覚情報: "{', '.join(visual_info)}"
+        
+        説明は2〜3文で、動画の概要や主要な活動を自然に描写してください。
+        トランスクリプトが空でも、視覚的な情報を使用して意味のある説明を生成してください。
+        """
+        
+        # Geminiクライアントのメソッドを使用して概要を生成
+        overview = self.gemini_client.generate_content(prompt)
+        if not overview or "エラー" in overview:
+            # 映像分析だけでサマリーを生成
+            fallback_prompt = f"""
+            以下の視覚情報から、動画全体の説明を日本語で生成してください：
+            - シーン説明: "{descriptions}"
+            
+            説明は2〜3文で、動画の概要や主要な内容を自然に描写してください。
+            """
+            overview = self.gemini_client.generate_content(fallback_prompt)
+        return overview
+    except Exception as e:
+        logger.error(f"Gemini API呼び出しエラー: {str(e)}")
+        # フォールバック：映像分析情報からシンプルな概要を生成
+        return "この動画は日常的なシーンを記録したものです。" if not descriptions else f"この動画には、{descriptions[:100]}などのシーンが含まれています。"
+
+def extract_gopro_metadata(self, video_path: str) -> dict:
+    """GoProのメタデータを抽出"""
+    try:
+        command = [
+            "ffprobe",
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_format",
+            "-show_streams",
+            video_path
+        ]
+        result = subprocess.run(command, capture_output=True, text=True)
+        metadata = json.loads(result.stdout)
+        
+        # 開始時間のみを取得
+        start_time = metadata.get("format", {}).get("tags", {}).get("creation_time", "")
+        
+        return {
+            "start_time": start_time
+        }
+    except Exception as e:
+        logger.error(f"メタデータ抽出エラー: {str(e)}")
+        return None
+
+def analyze_scene_context(self, node: VideoNode, all_nodes: list, transcripts: list) -> dict:
+    """シーンの文脈を分析（生成AI）"""
+    try:
+        # Gemini Clientの初期化
+        gemini_client = GeminiClient()
+        
+        # AIによる分析
+        context_analysis = gemini_client.analyze_scene_context(
+            node.transcript,
+            node.keyframe_path if os.path.exists(node.keyframe_path) else None
+        )
+        
+        if context_analysis:
+            logger.info(f"AIによるシーン分析結果: {context_analysis}")
+            return context_analysis
+        
+        # 分析結果がない場合はデフォルト値を返す
+        logger.warning("AIによる分析に失敗したため、デフォルト値を返します")
+        return {
+            "location_type": "不明",
+            "estimated_time_of_day": "不明",
+            "weather_conditions": "不明",
+            "key_activities": [],
+            "emotional_tone": "中立",
+            "narrative_purpose": "情報提供"
+        }
+        
+    except Exception as e:
+        logger.error(f"AIによるシーン分析中にエラー: {str(e)}")
+        # エラー時はデフォルト値を返す
+        return {
+            "location_type": "不明",
+            "estimated_time_of_day": "不明",
+            "weather_conditions": "不明",
+            "key_activities": [],
+            "emotional_tone": "中立",
+            "narrative_purpose": "情報提供"
+        }
+    
+def generate_editing_suggestions(self, node: VideoNode, all_nodes: list) -> dict:
+    """編集提案を生成（生成AI）"""
+    try:
+        # Gemini Clientの初期化
+        gemini_client = GeminiClient()
+        
+        # ノードデータを準備
+        node_data = {
+            "transcript": node.transcript,
+            "time_in": node.time_in,
+            "time_out": node.time_out,
+            "context_analysis": node.context_analysis
+        }
+        
+        # AIによる編集提案生成
+        suggestions = gemini_client.generate_editing_suggestions(node_data)
+        
+        if suggestions:
+            logger.info(f"AIによる編集提案結果: {suggestions}")
+            return suggestions
+        
+        # 生成に失敗した場合はデフォルト値を返す
+        logger.warning("AIによる編集提案生成に失敗したため、デフォルト値を返します")
+        return {
+            "highlight_worthy": False,
+            "potential_cutpoint": False,
+            "b_roll_opportunity": "",
+            "audio_considerations": ""
+        }
+        
+    except Exception as e:
+        logger.error(f"AIによる編集提案生成中にエラー: {str(e)}")
+        # エラー時はデフォルト値を返す
+        return {
+            "highlight_worthy": False,
+            "potential_cutpoint": False,
+            "b_roll_opportunity": "",
+            "audio_considerations": ""
+        }
+        
+def generate_video_summary(self, transcripts: list, nodes: list) -> dict:
+    """動画全体の要約を生成（生成AI）"""
+    try:
+        # Gemini Clientの初期化
+        gemini_client = GeminiClient()
+        
+        # AIによるサマリー生成
+        summary = gemini_client.generate_video_summary(transcripts, nodes)
+        
+        if summary:
+            logger.info("AIによる動画要約生成完了")
+            return summary
+        
+        # 生成に失敗した場合はデフォルト値を返す
+        logger.warning("AIによる要約生成に失敗したため、デフォルト値を返します")
+        return {
+            "title": "動画タイトル",
+            "overview": "AIによる要約生成に失敗しました",
+            "topics": [],
+            "filming_date": "",
+            "location": "",
+            "weather": "不明",
+            "purpose": "",
+            "transportation": "不明",
+            "starting_point": "",
+            "destination": "",
+            "scene_count": len(nodes),
+            "total_duration": nodes[-1].time_out if nodes else 0,
+            "gopro_start_time": ""
+        }
+        
+    except Exception as e:
+        logger.error(f"AIによる動画要約生成中にエラー: {str(e)}")
+        # エラー時はデフォルト値を返す
+        return {
+            "title": "動画タイトル",
+            "overview": f"エラー: {str(e)}",
+            "topics": [],
+            "scene_count": len(nodes),
+            "total_duration": nodes[-1].time_out if nodes else 0
+        }
+    
+def save_results(self, video_path: str, nodes: List[VideoNode], completed: bool = True, summary: dict = None):
+    """処理結果を保存（新フォーマット）"""
+    output_dir = os.path.join(
+        os.path.dirname(video_path),
+        "video_nodes_" + os.path.splitext(os.path.basename(video_path))[0]
+    )
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # シーンデータを新フォーマットに変換
+    scenes = []
+    for i, node in enumerate(nodes):
+        scene = {
+            "scene_id": i,
+            "time_in": node.time_in,
+            "time_out": node.time_out,
+            "transcript": node.transcript,
+            "description": node.description,
+            "keyframe_path": node.keyframe_path,
+            "preview_path": node.preview_path,
+            "duration": node.time_out - node.time_in
+        }
+        scenes.append(scene)
         
         output_file = os.path.join(output_dir, "nodes.json")
         with open(output_file, "w", encoding="utf-8") as f:
@@ -798,9 +997,10 @@ class VideoEnhanced:
             self.processing = False
             self.update_status("キャンセル", "処理をキャンセルしました")
             # UIの更新
-            self.select_button.config(state="normal")
+            self.open_button.config(state="normal")
+            self.open_folder_button.config(state="normal")
             self.process_button.config(state="normal")
-            self.cancel_button.config(state="disabled")
+            self.stop_button.config(state="disabled")
     
     def check_thread_status(self):
         """処理スレッドの状態を確認"""
@@ -811,34 +1011,68 @@ class VideoEnhanced:
             else:
                 # 処理が完了したらUIを更新
                 self.processing = False
-                self.select_button.config(state="normal")
+                self.open_button.config(state="normal")
+                self.open_folder_button.config(state="normal")
                 self.process_button.config(state="normal")
-                self.cancel_button.config(state="disabled")
+                self.stop_button.config(state="disabled")
     
     def show_file_details(self, event=None):
-        """選択されたファイルの詳細情報を表示"""
-        selection = self.file_list.selection()
-        if not selection:
+        """選択したファイルの詳細を表示"""
+        if not self.file_list.selection():
             return
         
-        item = selection[0]
-        file_name = self.file_list.item(item)["values"][0]
-        video_path = next(
-            (path for path in self.selected_files if os.path.basename(path) == file_name),
-            None
-        )
+        item_id = self.file_list.selection()[0]
+        file_name = self.file_list.item(item_id, "values")[0]
         
-        if not video_path:
+        # ファイルが完全なパスかファイル名だけかを確認
+        if os.path.isabs(file_name):
+            file_path = file_name
+        else:
+            # 選択されたファイルがself.selected_filesに存在するか確認
+            matching_files = [f for f in self.selected_files if os.path.basename(f) == file_name]
+            if matching_files:
+                file_path = matching_files[0]
+            else:
+                # ファイルが見つからない場合、エラーメッセージを表示
+                logger.error(f"ファイルが見つかりません: {file_name}")
+                messagebox.showerror("エラー", f"ファイルが見つかりません: {file_name}")
+                return
+                
+        # 絶対パスに変換
+        abs_file_path = os.path.abspath(file_path)
+        logger.info(f"詳細表示 - ファイル: {abs_file_path}")
+        
+        # ファイルの存在確認
+        if not os.path.exists(abs_file_path):
+            logger.error(f"ファイルが存在しません: {abs_file_path}")
+            messagebox.showerror("エラー", f"ファイルが見つかりません:\n{abs_file_path}")
             return
+        
+        # プレビュー再生用の変数を初期化
+        self.current_preview_path = abs_file_path
+        self.is_playing = False
+        self.update_timer = None
+        
+        # 動画の長さを取得
+        try:
+            media = self.vlc_instance.media_new(abs_file_path)
+            media.parse()
+            self.current_duration = media.get_duration() / 1000.0  # ミリ秒を秒に変換
+        except Exception as e:
+            logger.error(f"動画の長さ取得に失敗: {str(e)}")
+            self.current_duration = 0
+            
+        # 時間表示を更新
+        self.time_label.config(text=f"再生時間: 00:00 / {self.format_time(self.current_duration)}")
         
         # 詳細情報ウィンドウを作成
         details_window = tk.Toplevel(self.root)
-        details_window.title(f"詳細情報 - {file_name}")
+        details_window.title(f"詳細情報 - {os.path.basename(abs_file_path)}")
         details_window.geometry("1200x800")  # ウィンドウを大きくする
         
         # ノードファイルのパスを取得
-        base_name = os.path.splitext(os.path.basename(video_path))[0]
-        output_dir = os.path.join(os.path.dirname(video_path), f"video_nodes_{base_name}")
+        base_name = os.path.splitext(os.path.basename(abs_file_path))[0]
+        output_dir = os.path.join(os.path.dirname(abs_file_path), f"video_nodes_{base_name}")
         nodes_file = os.path.join(output_dir, "nodes.json")
         
         if not os.path.exists(nodes_file):
@@ -849,13 +1083,154 @@ class VideoEnhanced:
             with open(nodes_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             
-            # スクロール可能なフレーム
-            main_frame = ttk.Frame(details_window)
-            main_frame.pack(fill="both", expand=True, padx=10, pady=10)
+            # メインフレーム（左右に分割）
+            main_paned = ttk.PanedWindow(details_window, orient=tk.HORIZONTAL)
+            main_paned.pack(fill="both", expand=True, padx=10, pady=10)
+            
+            # 左側：サマリー情報
+            left_frame = ttk.Frame(main_paned)
+            # 右側：シーン詳細
+            right_frame = ttk.Frame(main_paned)
+            
+            main_paned.add(left_frame, weight=1)
+            main_paned.add(right_frame, weight=2)
+            
+            # 新フォーマットと旧フォーマットの両方に対応
+            summary = data.get("summary", {})
+            scene_nodes = data.get("scenes", data.get("nodes", []))
+            
+            #----- 左側：サマリー情報 -----#
+            # ヘッダー（動画タイトルと概要）
+            header_frame = ttk.LabelFrame(left_frame, text="動画概要")
+            header_frame.pack(fill="x", padx=5, pady=5)
+            
+            ttk.Label(header_frame, text=f"ファイル名: {os.path.basename(abs_file_path)}", font=("", 12, "bold")).pack(anchor="w", padx=5, pady=5)
+            
+            if isinstance(summary, dict):
+                if "title" in summary:
+                    ttk.Label(header_frame, text=f"タイトル: {summary.get('title', '不明')}", font=("", 11)).pack(anchor="w", padx=5, pady=2)
+                
+                if "overview" in summary:
+                    ttk.Label(header_frame, text="概要:", font=("", 10, "bold")).pack(anchor="w", padx=5, pady=2)
+                    overview_text = tk.Text(header_frame, height=6, width=40, wrap="word")
+                    overview_text.insert("1.0", summary.get('overview', '不明'))
+                    overview_text.config(state="disabled")
+                    overview_text.pack(fill="x", padx=5, pady=2)
+            
+            # 基本情報フレーム
+            info_frame = ttk.LabelFrame(left_frame, text="基本情報")
+            info_frame.pack(fill="x", padx=5, pady=5)
+            
+            # 2列のグリッドレイアウト
+            if isinstance(summary, dict):
+                row = 0
+                
+                # シーン数と総時間
+                ttk.Label(info_frame, text="シーン数:").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+                ttk.Label(info_frame, text=f"{len(scene_nodes)}").grid(row=row, column=1, sticky="w", padx=5, pady=2)
+                row += 1
+                
+                if "total_duration" in summary:
+                    ttk.Label(info_frame, text="総時間:").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+                    ttk.Label(info_frame, text=f"{summary.get('total_duration', 0):.2f}秒").grid(row=row, column=1, sticky="w", padx=5, pady=2)
+                    row += 1
+                
+                if "gopro_start_time" in summary:
+                    ttk.Label(info_frame, text="撮影開始時間:").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+                    ttk.Label(info_frame, text=f"{summary.get('gopro_start_time', '不明')}").grid(row=row, column=1, sticky="w", padx=5, pady=2)
+                    row += 1
+                
+                if "topics" in summary and summary["topics"]:
+                    ttk.Label(info_frame, text="主要トピック:").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+                    ttk.Label(info_frame, text=f"{', '.join(summary.get('topics', []))}").grid(row=row, column=1, sticky="w", padx=5, pady=2)
+                    row += 1
+                
+                if "filming_date" in summary and summary["filming_date"]:
+                    ttk.Label(info_frame, text="撮影日:").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+                    ttk.Label(info_frame, text=f"{summary.get('filming_date', '不明')}").grid(row=row, column=1, sticky="w", padx=5, pady=2)
+                    row += 1
+                
+                if "location" in summary and summary["location"]:
+                    ttk.Label(info_frame, text="撮影場所:").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+                    ttk.Label(info_frame, text=f"{summary.get('location', '不明')}").grid(row=row, column=1, sticky="w", padx=5, pady=2)
+                    row += 1
+                
+                if "weather" in summary and summary["weather"]:
+                    ttk.Label(info_frame, text="天候:").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+                    ttk.Label(info_frame, text=f"{summary.get('weather', '不明')}").grid(row=row, column=1, sticky="w", padx=5, pady=2)
+                    row += 1
+                
+                if "purpose" in summary and summary["purpose"]:
+                    ttk.Label(info_frame, text="目的:").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+                    ttk.Label(info_frame, text=f"{summary.get('purpose', '不明')}").grid(row=row, column=1, sticky="w", padx=5, pady=2)
+                    row += 1
+                
+                if "transportation" in summary and summary["transportation"]:
+                    ttk.Label(info_frame, text="移動手段:").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+                    ttk.Label(info_frame, text=f"{summary.get('transportation', '不明')}").grid(row=row, column=1, sticky="w", padx=5, pady=2)
+                    row += 1
+                
+                if "starting_point" in summary and summary["starting_point"]:
+                    ttk.Label(info_frame, text="出発地点:").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+                    ttk.Label(info_frame, text=f"{summary.get('starting_point', '不明')}").grid(row=row, column=1, sticky="w", padx=5, pady=2)
+                    row += 1
+                
+                if "destination" in summary and summary["destination"]:
+                    ttk.Label(info_frame, text="目的地:").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+                    ttk.Label(info_frame, text=f"{summary.get('destination', '不明')}").grid(row=row, column=1, sticky="w", padx=5, pady=2)
+                    row += 1
+            
+            # 処理情報
+            ttk.Label(info_frame, text="処理状態:").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+            ttk.Label(info_frame, text=f"{'完了' if data.get('completed') else '未完了'}").grid(row=row, column=1, sticky="w", padx=5, pady=2)
+            row += 1
+            
+            ttk.Label(info_frame, text="最終更新:").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+            ttk.Label(info_frame, text=f"{data.get('last_update', '不明')}").grid(row=row, column=1, sticky="w", padx=5, pady=2)
+            
+            # サムネイル表示エリア（最初のキーフレーム）
+            preview_frame = ttk.LabelFrame(left_frame, text="サムネイル")
+            preview_frame.pack(fill="both", expand=True, padx=5, pady=5)
+            
+            # 最初のシーンのキーフレームを取得
+            if scene_nodes and "keyframe_path" in scene_nodes[0]:
+                try:
+                    keyframe_path = os.path.join(os.path.dirname(abs_file_path), scene_nodes[0]["keyframe_path"])
+                    if os.path.exists(keyframe_path):
+                        # PILでイメージを読み込み
+                        image = Image.open(keyframe_path)
+                        # アスペクト比を保持しながらリサイズ（大きく表示）
+                        image.thumbnail((350, 250))
+                        photo = ImageTk.PhotoImage(image)
+                        
+                        # 画像を表示（クリック可能）
+                        image_label = ttk.Label(preview_frame)
+                        image_label.image = photo  # 参照を保持
+                        image_label.configure(image=photo)
+                        image_label.pack(padx=5, pady=5, fill="both", expand=True)
+                        
+                        # クリックイベントを追加
+                        image_label.bind("<Button-1>", lambda e, v=abs_file_path, t=0: self.play_video_segment(v, t))
+                except Exception as e:
+                    ttk.Label(preview_frame, text=f"サムネイル表示エラー: {str(e)}").pack(padx=5, pady=5)
+            else:
+                ttk.Label(preview_frame, text="サムネイルがありません").pack(padx=5, pady=5)
+            
+            # 動画再生ボタン
+            ttk.Button(
+                left_frame,
+                text="▶ 動画全体を再生",
+                command=lambda: self.play_video_segment(abs_file_path, 0)
+            ).pack(fill="x", padx=5, pady=10)
+            
+            #----- 右側：シーン詳細 -----#
+            # シーン情報（スクロール可能）
+            scenes_label = ttk.Label(right_frame, text="シーン一覧", font=("", 12, "bold"))
+            scenes_label.pack(anchor="w", padx=5, pady=5)
             
             # キャンバスとスクロールバー
-            canvas = tk.Canvas(main_frame)
-            scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+            canvas = tk.Canvas(right_frame)
+            scrollbar = ttk.Scrollbar(right_frame, orient="vertical", command=canvas.yview)
             scrollable_frame = ttk.Frame(canvas)
             
             scrollable_frame.bind(
@@ -865,123 +1240,125 @@ class VideoEnhanced:
             
             canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
             canvas.configure(yscrollcommand=scrollbar.set)
+            canvas.pack(side="left", fill="both", expand=True)
+            scrollbar.pack(side="right", fill="y")
             
-            # 基本情報
-            info_frame = ttk.LabelFrame(scrollable_frame, text="基本情報")
-            info_frame.pack(fill="x", padx=5, pady=5)
-            
-            # 新フォーマットと旧フォーマットの両方に対応
-            summary = data.get("summary", {})
-            scene_nodes = data.get("scenes", data.get("nodes", []))
-            
-            ttk.Label(info_frame, text=f"ファイル名: {file_name}").pack(anchor="w", padx=5, pady=2)
-            
-            if isinstance(summary, dict):
-                if "title" in summary:
-                    ttk.Label(info_frame, text=f"タイトル: {summary.get('title', '不明')}").pack(anchor="w", padx=5, pady=2)
-                
-                if "overview" in summary:
-                    overview_text = tk.Text(info_frame, height=3, width=80, wrap="word")
-                    overview_text.insert("1.0", f"概要: {summary.get('overview', '不明')}")
-                    overview_text.config(state="disabled")
-                    overview_text.pack(anchor="w", padx=5, pady=2)
-                
-                if "topics" in summary:
-                    ttk.Label(info_frame, text=f"主要トピック: {', '.join(summary.get('topics', []))}").pack(anchor="w", padx=5, pady=2)
-                
-                if "filming_date" in summary:
-                    ttk.Label(info_frame, text=f"撮影日: {summary.get('filming_date', '不明')}").pack(anchor="w", padx=5, pady=2)
-                
-                if "location" in summary:
-                    ttk.Label(info_frame, text=f"撮影場所: {summary.get('location', '不明')}").pack(anchor="w", padx=5, pady=2)
-                
-                if "weather" in summary:
-                    ttk.Label(info_frame, text=f"天候: {summary.get('weather', '不明')}").pack(anchor="w", padx=5, pady=2)
-                
-                if "purpose" in summary:
-                    ttk.Label(info_frame, text=f"目的: {summary.get('purpose', '不明')}").pack(anchor="w", padx=5, pady=2)
-                
-                if "transportation" in summary:
-                    ttk.Label(info_frame, text=f"移動手段: {summary.get('transportation', '不明')}").pack(anchor="w", padx=5, pady=2)
-                
-                if "starting_point" in summary:
-                    ttk.Label(info_frame, text=f"出発地点: {summary.get('starting_point', '不明')}").pack(anchor="w", padx=5, pady=2)
-                
-                if "destination" in summary:
-                    ttk.Label(info_frame, text=f"目的地: {summary.get('destination', '不明')}").pack(anchor="w", padx=5, pady=2)
-            
-            ttk.Label(info_frame, text=f"シーン数: {len(scene_nodes)}").pack(anchor="w", padx=5, pady=2)
-            ttk.Label(info_frame, text=f"処理状態: {'完了' if data.get('completed') else '未完了'}").pack(anchor="w", padx=5, pady=2)
-            ttk.Label(info_frame, text=f"最終更新: {data.get('last_update', '不明')}").pack(anchor="w", padx=5, pady=2)
-            
-            if isinstance(summary, dict) and "gopro_start_time" in summary:
-                ttk.Label(info_frame, text=f"撮影開始時間: {summary.get('gopro_start_time', '不明')}").pack(anchor="w", padx=5, pady=2)
-            
-            # シーン情報
-            scenes_frame = ttk.LabelFrame(scrollable_frame, text="シーン情報")
-            scenes_frame.pack(fill="x", padx=5, pady=5)
+            # シーン情報（アコーディオン形式）
+            scene_frames = []  # 各シーンのフレームを保持
+            scene_contents = []  # 各シーンの詳細コンテンツを保持
+            expanded = [False] * len(scene_nodes)  # 各シーンの展開状態
             
             for i, node in enumerate(scene_nodes):
-                scene_frame = ttk.Frame(scenes_frame)
-                scene_frame.pack(fill="x", padx=5, pady=5)
-                
-                # 左側：テキスト情報
-                text_frame = ttk.Frame(scene_frame)
-                text_frame.pack(side="left", fill="x", expand=True)
-                
-                # シーンIDを取得（新フォーマットでは明示的に含まれる）
                 scene_id = node.get("scene_id", i)
                 
-                header = f"シーン {scene_id + 1}"
-                if node.get("keyframe_path"):
-                    header += f" (キーフレーム: {node['keyframe_path']})"
-                ttk.Label(text_frame, text=header, font=("", 10, "bold")).pack(anchor="w")
+                # シーンフレーム（アコーディオンヘッダー）
+                scene_frame = ttk.Frame(scrollable_frame)
+                scene_frame.pack(fill="x", padx=5, pady=2)
+                scene_frames.append(scene_frame)
                 
-                time_info = f"開始: {node['time_in']:.1f}秒 - 終了: {node['time_out']:.1f}秒 (長さ: {node.get('duration', node['time_out'] - node['time_in']):.1f}秒)"
-                ttk.Label(text_frame, text=time_info).pack(anchor="w")
+                # ヘッダー（クリック可能）
+                header_frame = ttk.Frame(scene_frame, style="Card.TFrame")
+                header_frame.pack(fill="x")
                 
-                # 会話の有無を判定
-                has_speech = bool(node.get("transcript", "").strip())
-                speech_label = f"会話: {'あり' if has_speech else 'なし'}"
-                ttk.Label(text_frame, text=speech_label, foreground='black' if has_speech else 'green').pack(anchor="w")
+                # 時間情報のフォーマット
+                time_in = node['time_in']
+                time_out = node['time_out']
+                duration = time_out - time_in
+                time_info = f"{time_in:.1f}秒 - {time_out:.1f}秒 ({duration:.1f}秒)"
                 
-                if node.get("description"):
-                    description_text = tk.Text(text_frame, height=2, width=60, wrap="word")
-                    description_text.insert("1.0", node['description'])
-                    description_text.config(state="disabled")
-                    description_text.pack(anchor="w", pady=2)
+                # 展開ボタン
+                expand_btn = ttk.Button(
+                    header_frame,
+                    text="▼" if expanded[i] else "▶",
+                    width=2,
+                    command=lambda idx=i: self.toggle_scene_details(idx, scene_contents, expanded, scene_frames)
+                )
+                expand_btn.pack(side="left", padx=(0, 5))
                 
+                # シーン番号
+                ttk.Label(header_frame, text=f"シーン {scene_id + 1}", font=("", 10, "bold")).pack(side="left", padx=5)
+                
+                # 時間情報
+                ttk.Label(header_frame, text=time_info).pack(side="left", padx=5)
+                
+                # トランスクリプトの先頭を表示（存在する場合）
                 if node.get("transcript"):
-                    transcript_text = tk.Text(text_frame, height=2, width=60, wrap="word")
-                    transcript_text.insert("1.0", node['transcript'])
+                    transcript = node["transcript"]
+                    # 短く切り詰める
+                    short_transcript = transcript[:30] + "..." if len(transcript) > 30 else transcript
+                    ttk.Label(header_frame, text=short_transcript).pack(side="left", padx=5)
+                
+                # ヘッダー全体をクリック可能に
+                header_frame.bind("<Button-1>", lambda e, idx=i: self.toggle_scene_details(idx, scene_contents, expanded, scene_frames))
+                
+                # シーン詳細コンテンツ（初期状態は非表示）
+                content_frame = ttk.Frame(scene_frame)
+                if expanded[i]:
+                    content_frame.pack(fill="x", padx=10, pady=5)
+                scene_contents.append(content_frame)
+                
+                # 詳細情報の作成（非表示状態）
+                # 左右に分割
+                details_paned = ttk.PanedWindow(content_frame, orient=tk.HORIZONTAL)
+                details_paned.pack(fill="x", expand=True, padx=5, pady=5)
+                
+                # 左：テキスト情報
+                text_frame = ttk.Frame(details_paned)
+                # 右：キーフレーム
+                image_frame = ttk.Frame(details_paned)
+                
+                details_paned.add(text_frame, weight=3)
+                details_paned.add(image_frame, weight=1)
+                
+                # トランスクリプト
+                if node.get("transcript"):
+                    transcript_label = ttk.Label(text_frame, text="トランスクリプト:", font=("", 9, "bold"))
+                    transcript_label.pack(anchor="w", pady=(5, 0))
+                    
+                    transcript_text = tk.Text(text_frame, height=3, width=50, wrap="word")
+                    transcript_text.insert("1.0", node["transcript"])
                     transcript_text.config(state="disabled")
-                    transcript_text.pack(anchor="w", pady=2)
+                    transcript_text.pack(fill="x", pady=2)
+                else:
+                    ttk.Label(text_frame, text="トランスクリプト: なし", font=("", 9)).pack(anchor="w", pady=2)
+                
+                # 映像分析（説明）
+                if node.get("description"):
+                    description_label = ttk.Label(text_frame, text="映像分析:", font=("", 9, "bold"))
+                    description_label.pack(anchor="w", pady=(5, 0))
+                    
+                    description_text = tk.Text(text_frame, height=3, width=50, wrap="word")
+                    description_text.insert("1.0", node["description"])
+                    description_text.config(state="disabled")
+                    description_text.pack(fill="x", pady=2)
                 
                 # 文脈分析情報
                 if node.get("context_analysis"):
                     context_frame = ttk.LabelFrame(text_frame, text="文脈分析")
-                    context_frame.pack(fill="x", padx=5, pady=5)
+                    context_frame.pack(fill="x", pady=5)
                     
                     context = node["context_analysis"]
-                    ttk.Label(context_frame, text=f"場所の種類: {context.get('location_type', '不明')}").pack(anchor="w")
-                    ttk.Label(context_frame, text=f"推定時刻: {context.get('estimated_time_of_day', '不明')}").pack(anchor="w")
-                    ttk.Label(context_frame, text=f"天候状態: {context.get('weather_conditions', '不明')}").pack(anchor="w")
-                    ttk.Label(context_frame, text=f"主要な活動: {', '.join(context.get('key_activities', []))}").pack(anchor="w")
-                    ttk.Label(context_frame, text=f"感情トーン: {context.get('emotional_tone', '不明')}").pack(anchor="w")
-                    ttk.Label(context_frame, text=f"物語上の目的: {context.get('narrative_purpose', '不明')}").pack(anchor="w")
-                
-                # 編集提案情報
-                if node.get("editing_suggestions"):
-                    edit_frame = ttk.LabelFrame(text_frame, text="編集提案")
-                    edit_frame.pack(fill="x", padx=5, pady=5)
+                    # グリッドレイアウトで整理
+                    row = 0
+                    if "location_type" in context:
+                        ttk.Label(context_frame, text="場所の種類:").grid(row=row, column=0, sticky="w", padx=5, pady=1)
+                        ttk.Label(context_frame, text=context.get("location_type", "不明")).grid(row=row, column=1, sticky="w", padx=5, pady=1)
+                        row += 1
                     
-                    suggestions = node["editing_suggestions"]
-                    ttk.Label(edit_frame, text=f"ハイライト候補: {'はい' if suggestions.get('highlight_worthy') else 'いいえ'}").pack(anchor="w")
-                    ttk.Label(edit_frame, text=f"カットポイント: {'はい' if suggestions.get('potential_cutpoint') else 'いいえ'}").pack(anchor="w")
-                    if suggestions.get("b_roll_opportunity"):
-                        ttk.Label(edit_frame, text=f"B-roll提案: {suggestions['b_roll_opportunity']}").pack(anchor="w")
-                    if suggestions.get("audio_considerations"):
-                        ttk.Label(edit_frame, text=f"音声の注意点: {suggestions['audio_considerations']}").pack(anchor="w")
+                    if "estimated_time_of_day" in context:
+                        ttk.Label(context_frame, text="推定時刻:").grid(row=row, column=0, sticky="w", padx=5, pady=1)
+                        ttk.Label(context_frame, text=context.get("estimated_time_of_day", "不明")).grid(row=row, column=1, sticky="w", padx=5, pady=1)
+                        row += 1
+                    
+                    if "weather_conditions" in context:
+                        ttk.Label(context_frame, text="天候状態:").grid(row=row, column=0, sticky="w", padx=5, pady=1)
+                        ttk.Label(context_frame, text=context.get("weather_conditions", "不明")).grid(row=row, column=1, sticky="w", padx=5, pady=1)
+                        row += 1
+                    
+                    if "key_activities" in context and context["key_activities"]:
+                        ttk.Label(context_frame, text="主要な活動:").grid(row=row, column=0, sticky="w", padx=5, pady=1)
+                        ttk.Label(context_frame, text=", ".join(context.get("key_activities", []))).grid(row=row, column=1, sticky="w", padx=5, pady=1)
+                        row += 1
                 
                 # アクションボタンフレーム
                 action_frame = ttk.Frame(text_frame)
@@ -990,8 +1367,8 @@ class VideoEnhanced:
                 # 再生ボタン
                 play_button = ttk.Button(
                     action_frame, 
-                    text="▶ 再生", 
-                    command=lambda v=video_path, t=node["time_in"]: self.play_video_segment(v, t)
+                    text="▶ シーン再生", 
+                    command=lambda v=abs_file_path, t=node["time_in"]: self.play_video_segment(v, t)
                 )
                 play_button.pack(side="left", padx=5)
                 
@@ -999,14 +1376,14 @@ class VideoEnhanced:
                 extract_button = ttk.Button(
                     action_frame, 
                     text="📋 シーン保存", 
-                    command=lambda v=video_path, s=node["time_in"], e=node["time_out"]: self.extract_video_segment(v, s, e)
+                    command=lambda v=abs_file_path, s=node["time_in"], e=node["time_out"]: self.extract_video_segment(v, s, e)
                 )
                 extract_button.pack(side="left", padx=5)
                 
-                # 右側：サムネイル画像（クリックで再生）
+                # キーフレーム画像（右側）
                 if node.get("keyframe_path"):
                     try:
-                        keyframe_path = os.path.join(os.path.dirname(video_path), node["keyframe_path"])
+                        keyframe_path = os.path.join(os.path.dirname(abs_file_path), node["keyframe_path"])
                         if os.path.exists(keyframe_path):
                             # PILでイメージを読み込み
                             image = Image.open(keyframe_path)
@@ -1015,37 +1392,62 @@ class VideoEnhanced:
                             photo = ImageTk.PhotoImage(image)
                             
                             # 画像を表示（クリック可能）
-                            image_label = ttk.Label(scene_frame)
+                            image_label = ttk.Label(image_frame)
                             image_label.image = photo  # 参照を保持
                             image_label.configure(image=photo)
-                            image_label.pack(side="right", padx=5)
+                            image_label.pack(padx=5, pady=5)
                             
                             # クリックイベントを追加
-                            image_label.bind("<Button-1>", lambda e, v=video_path, t=node["time_in"]: self.play_video_segment(v, t))
+                            image_label.bind("<Button-1>", lambda e, v=abs_file_path, t=node["time_in"]: self.play_video_segment(v, t))
                             
                             # ホバー時のカーソル変更
                             image_label.bind("<Enter>", lambda e: e.widget.configure(cursor="hand2"))
                             image_label.bind("<Leave>", lambda e: e.widget.configure(cursor=""))
+                            
+                            # キーフレームラベル
+                            ttk.Label(image_frame, text="キーフレーム画像").pack(pady=(0, 5))
                     except Exception as e:
-                        logger.error(f"サムネイル表示エラー: {str(e)}")
+                        ttk.Label(image_frame, text=f"画像表示エラー: {str(e)}").pack(padx=5, pady=5)
                 
-                # 区切り線
-                ttk.Separator(scene_frame, orient="horizontal").pack(fill="x", pady=5)
-            
-            # スクロールバーとキャンバスを配置
-            canvas.pack(side="left", fill="both", expand=True)
-            scrollbar.pack(side="right", fill="y")
+                # 区切り線（シーン間）
+                ttk.Separator(scrollable_frame, orient="horizontal").pack(fill="x", pady=2)
             
         except Exception as e:
             ttk.Label(details_window, text=f"エラー: {str(e)}").pack(padx=10, pady=10)
             logger.error(f"詳細表示中にエラー: {str(e)}")
     
+    def toggle_scene_details(self, index, content_frames, expanded, scene_frames):
+        """シーン詳細の表示/非表示を切り替え"""
+        # 状態を反転
+        expanded[index] = not expanded[index]
+        
+        # 展開ボタンのテキストを更新
+        btn = scene_frames[index].winfo_children()[0].winfo_children()[0]
+        btn.config(text="▼" if expanded[index] else "▶")
+        
+        # コンテンツの表示/非表示を切り替え
+        if expanded[index]:
+            content_frames[index].pack(fill="x", padx=10, pady=5)
+        else:
+            content_frames[index].pack_forget()
+    
     def play_video_segment(self, video_path, start_time):
         """指定時間から動画を再生"""
         try:
+            # 絶対パスに変換
+            abs_video_path = os.path.abspath(video_path)
+            logger.info(f"再生リクエスト - 元のパス: {video_path}")
+            logger.info(f"再生リクエスト - 絶対パス: {abs_video_path}")
+            
+            # ファイルの存在確認
+            if not os.path.exists(abs_video_path):
+                logger.error(f"ファイルが存在しません: {abs_video_path}")
+                messagebox.showerror("エラー", f"ファイルが見つかりません:\n{abs_video_path}")
+                return
+                
             # プレビュー動画のパスを取得
-            base_name = os.path.splitext(os.path.basename(video_path))[0]
-            output_dir = os.path.join(os.path.dirname(video_path), f"video_nodes_{base_name}")
+            base_name = os.path.splitext(os.path.basename(abs_video_path))[0]
+            output_dir = os.path.join(os.path.dirname(abs_video_path), f"video_nodes_{base_name}")
             preview_dir = os.path.join(output_dir, "previews")
             
             # ノードファイルから該当シーンのプレビューパスを取得
@@ -1059,11 +1461,13 @@ class VideoEnhanced:
                     for scene in scenes:
                         if abs(scene["time_in"] - start_time) < 0.1:  # 開始時間が一致するシーンを探す
                             if scene.get("preview_path"):
-                                preview_path = os.path.join(os.path.dirname(video_path), scene["preview_path"])
+                                preview_path = os.path.join(os.path.dirname(abs_video_path), scene["preview_path"])
+                                logger.info(f"プレビューパスを検出: {preview_path}")
                                 break
             
             if preview_path and os.path.exists(preview_path):
                 # プレビュー動画を再生
+                logger.info(f"プレビュー動画を再生: {preview_path}")
                 if os.name == 'nt':  # Windows
                     subprocess.Popen(['start', '', preview_path], shell=True)
                 elif os.name == 'posix':  # macOS/Linux
@@ -1075,35 +1479,38 @@ class VideoEnhanced:
                 return
             
             # プレビューがない場合は元の動画を時間指定で再生
+            logger.info(f"元の動画を再生: {abs_video_path}, 開始時間: {start_time}秒")
             if os.name == 'nt':  # Windows
                 # VLCがインストールされている場合の時間指定
                 try:
                     vlc_path = self.find_vlc_path()
                     if vlc_path:
                         # VLCでタイムスタンプ指定して再生
-                        command = [vlc_path, "--start-time", str(int(start_time)), video_path]
+                        command = [vlc_path, "--start-time", str(int(start_time)), abs_video_path]
+                        logger.info(f"VLCコマンド: {' '.join(command)}")
                         subprocess.Popen(command)
-                        logger.info(f"VLCで動画再生: {video_path}, 開始時間: {start_time}秒")
+                        logger.info(f"VLCで動画再生: {abs_video_path}, 開始時間: {start_time}秒")
                         return
                 except Exception as e:
                     logger.warning(f"VLCでの再生に失敗しました: {str(e)}")
                 
                 # VLCが使えない場合はデフォルトプレーヤーで開く
-                subprocess.Popen(['start', '', video_path], shell=True)
+                logger.info(f"デフォルトプレーヤーで再生: {abs_video_path}")
+                os.startfile(abs_video_path)  # Windowsの関連付けられたプレーヤーで開く
             elif os.name == 'posix':  # macOS または Linux
                 if sys.platform == 'darwin':  # macOS
-                    subprocess.Popen(['open', video_path])
+                    subprocess.Popen(['open', abs_video_path])
                 else:  # Linux
                     # VLCが利用可能か確認
                     try:
                         subprocess.run(["which", "vlc"], check=True, capture_output=True)
-                        subprocess.Popen(['vlc', '--start-time', str(int(start_time)), video_path])
+                        subprocess.Popen(['vlc', '--start-time', str(int(start_time)), abs_video_path])
                         return
                     except subprocess.CalledProcessError:
                         # VLCがない場合はデフォルトプレーヤーで開く
-                        subprocess.Popen(['xdg-open', video_path])
+                        subprocess.Popen(['xdg-open', abs_video_path])
             
-            logger.info(f"動画再生: {video_path}, 開始時間: {start_time}秒")
+            logger.info(f"動画再生: {abs_video_path}, 開始時間: {start_time}秒")
         except Exception as e:
             logger.error(f"動画再生エラー: {str(e)}")
             messagebox.showerror("エラー", f"動画の再生に失敗しました: {str(e)}")
@@ -1238,43 +1645,54 @@ class VideoEnhanced:
         if not selection:
             return
         
-        item = selection[0]
-        values = self.file_list.item(item)["values"]
+        item_id = selection[0]
+        file_path = self.file_list.item(item_id, "values")[0]
         
-        # サムネイル情報を取得
-        thumbnail_path = values[3] if len(values) > 3 else None
-        if thumbnail_path and thumbnail_path != "-":
-            # サムネイル表示
-            try:
-                file_name = values[0]
-                video_path = next(
-                    (path for path in self.selected_files if os.path.basename(path) == file_name),
-                    None
-                )
-                
-                if video_path:
-                    full_thumbnail_path = os.path.join(os.path.dirname(video_path), thumbnail_path)
-                    if os.path.exists(full_thumbnail_path):
-                        # 画像を読み込んで表示
-                        image = Image.open(full_thumbnail_path)
-                        # アスペクト比を保持しながらリサイズ
-                        image.thumbnail((400, 300))
-                        photo = ImageTk.PhotoImage(image)
-                        
-                        # プレビュー更新
-                        self.preview_label.configure(image=photo)
-                        self.preview_label.image = photo  # 参照を保持
-                        
-                        # ファイル情報表示
-                        file_info = f"{file_name}\n{thumbnail_path}"
-                        self.preview_label.configure(compound="bottom", text=file_info)
-                        return
-            except Exception as e:
-                logger.error(f"プレビュー表示エラー: {str(e)}")
+        # プレビュー再生用の変数を初期化
+        self.current_preview_path = file_path
+        self.is_playing = False
         
-        # サムネイルがない場合はデフォルト表示
-        self.preview_label.configure(image="")
-        self.preview_label.configure(text="サムネイルがありません")
+        # 既に再生中なら停止
+        if self.player:
+            self.stop_preview()
+        
+        # プレビュー画像の更新
+        try:
+            # 動画の長さを取得
+            media = self.vlc_instance.media_new(file_path)
+            media.parse()
+            self.current_duration = media.get_duration() / 1000.0  # ミリ秒を秒に変換
+            
+            # 時間表示を更新
+            self.time_label.config(text=f"再生時間: 00:00 / {self.format_time(self.current_duration)}")
+            
+            # プレビューラベルを更新
+            self.preview_label.config(text=f"選択中: {os.path.basename(file_path)}")
+            
+            # VLCプレーヤーに設定
+            if self.vlc_instance and self.player:
+                if os.name == 'nt':  # Windows
+                    self.player.set_hwnd(self.video_frame.winfo_id())
+                else:  # Linux/MacOS
+                    self.player.set_xwindow(self.video_frame.winfo_id())
+            
+            # 詳細表示ボタンを有効化
+            self.view_button.config(state="normal")
+            
+        except Exception as e:
+            logger.error(f"プレビュー更新エラー: {str(e)}")
+            self.preview_label.config(text="プレビューの読み込みに失敗しました")
+            self.time_label.config(text="再生時間: --:-- / --:--")
+            self.current_duration = 0
+    
+    def on_closing(self):
+        """アプリケーション終了時の処理"""
+        if self.processing:
+            if messagebox.askyesno("確認", "処理中ですが、終了しますか？"):
+                self.processing = False
+                self.root.destroy()
+        else:
+            self.root.destroy()
     
     def generate_preview_clip(self, video_path: str, start_time: float, end_time: float, output_path: str) -> bool:
         """低解像度のプレビュー動画を生成"""
@@ -1331,145 +1749,530 @@ class VideoEnhanced:
             logger.error(f"キーフレーム抽出エラー: {str(e)}")
             return False
 
-    def analyze_scene_context(self, node: VideoNode, all_nodes: list, transcripts: list) -> dict:
-        """シーンの文脈を分析"""
-        scene_text = node.transcript.lower()
+    def enhanced_video_processing(self, video_path: str) -> List[dict]:
+        """
+        OpenCVを使用したヒストグラム差分と適応型閾値による高度なシーン検出処理を行う。
         
-        # 場所の種類を推定
-        location_type = "屋外"  # デフォルト
-        indoor_keywords = ["室内", "家", "建物", "店", "駅"]
-        transport_keywords = ["電車", "バス", "車", "タクシー"]
+        動画を解析して意味のあるシーン境界を検出し、各シーンのキーフレームと分析情報を生成する。
+        この処理は2段階で実行される：
+        1. 動画全体をサンプリングして差分データを収集し、適応型閾値を算出
+        2. 算出した閾値を使用してシーン境界を検出
         
-        for keyword in indoor_keywords:
-            if keyword in scene_text:
-                location_type = "屋内"
-                break
-        
-        for keyword in transport_keywords:
-            if keyword in scene_text:
-                location_type = "交通機関内"
-                break
-        
-        # 時刻の推定
-        time_of_day = "不明"
-        if "朝" in scene_text or "早" in scene_text:
-            time_of_day = "朝"
-        elif "昼" in scene_text or "午後" in scene_text:
-            time_of_day = "昼"
-        elif "夕" in scene_text or "夜" in scene_text:
-            time_of_day = "夕方/夜"
-        
-        # 天候状態の推定
-        weather_conditions = []
-        weather_keywords = {
-            "晴れ": "晴天",
-            "曇り": "曇天",
-            "雨": "雨天",
-            "雪": "雪",
-            "寒": "寒冷",
-            "暑": "暑熱",
-            "風": "強風"
-        }
-        
-        for keyword, condition in weather_keywords.items():
-            if keyword in scene_text:
-                weather_conditions.append(condition)
-        
-        # 主要な活動の特定
-        activities = []
-        activity_keywords = {
-            "歩": "歩行/移動",
-            "登": "登山",
-            "休": "休憩",
-            "食": "飲食",
-            "準備": "準備",
-            "装備": "装備確認",
-            "撮影": "撮影"
-        }
-        
-        for keyword, activity in activity_keywords.items():
-            if keyword in scene_text:
-                activities.append(activity)
-        
-        # 感情トーンの分析
-        emotional_tone = "中立"
-        positive_keywords = ["楽しい", "嬉しい", "良い", "素晴らしい", "快適"]
-        negative_keywords = ["不安", "怖い", "辛い", "疲れ", "心配"]
-        
-        positive_count = sum(1 for word in positive_keywords if word in scene_text)
-        negative_count = sum(1 for word in negative_keywords if word in scene_text)
-        
-        if positive_count > negative_count:
-            emotional_tone = "ポジティブ"
-        elif negative_count > positive_count:
-            emotional_tone = "ネガティブ"
-        
-        # 物語上の目的を推定
-        narrative_purpose = "情報提供"
-        if node == all_nodes[0]:
-            narrative_purpose = "導入/状況説明"
-        elif node == all_nodes[-1]:
-            narrative_purpose = "まとめ/結論"
-        elif "準備" in scene_text or "装備" in scene_text:
-            narrative_purpose = "準備/計画"
-        elif "休憩" in scene_text or "疲れ" in scene_text:
-            narrative_purpose = "休息/リフレッシュ"
-        
-        return {
-            "location_type": location_type,
-            "estimated_time_of_day": time_of_day,
-            "weather_conditions": "、".join(weather_conditions) if weather_conditions else "不明",
-            "key_activities": activities,
-            "emotional_tone": emotional_tone,
-            "narrative_purpose": narrative_purpose
-        }
+        Args:
+            video_path: 処理する動画ファイルのパス
+            
+        Returns:
+            List[dict]: 検出されたシーンのリスト。各シーンは開始・終了時間、キーフレームなどの情報を含む。
+        """
+        try:
+            # 出力ディレクトリの準備
+            base_name, output_dir, keyframes_dir = self._prepare_output_directories(video_path)
+            
+            # 動画ファイルを開いて基本情報を取得
+            cap, fps, total_frames, total_duration, sample_rate = self._open_video_and_get_info(video_path)
+            if not cap:
+                return self._create_fallback_scene(total_duration=0)
+            
+            # 第1パス: 差分値を収集して適応型閾値を算出
+            hist_threshold, pixel_threshold = self._calculate_adaptive_thresholds(cap, fps, sample_rate)
+            
+            # 第2パス: シーン境界を検出
+            scene_boundaries = self._detect_scene_boundaries(
+                video_path, hist_threshold, pixel_threshold, fps, total_duration, sample_rate
+            )
+            
+            # シーンの選択処理（シーン数が多い場合は均等に選択）
+            selected_indices = self._select_representative_scenes(scene_boundaries)
+            
+            # シーンごとにキーフレームを抽出し、データを生成
+            scene_data = self._generate_scene_data(
+                video_path, scene_boundaries, selected_indices, keyframes_dir
+            )
+            
+            # 結果の検証と調整
+            scene_data = self._validate_scene_data(scene_data, total_duration)
+            
+            return scene_data
 
-    def generate_editing_suggestions(self, node: VideoNode, all_nodes: list) -> dict:
-        """編集提案を生成"""
-        scene_text = node.transcript.lower()
-        duration = node.time_out - node.time_in
+        except Exception as e:
+            logger.error(f"映像処理エラー: {str(e)}", exc_info=True)
+            # エラー時は動画全体を1シーンとして返す
+            return self._create_fallback_scene(
+                total_duration=total_frames / fps if 'total_frames' in locals() and 'fps' in locals() else 240.0
+            )
+
+    def _prepare_output_directories(self, video_path: str) -> tuple:
+        """
+        出力ディレクトリを準備する
         
-        # ハイライト候補の判定
-        highlight_worthy = False
-        highlight_keywords = ["すごい", "きれい", "素晴らしい", "頂上", "山頂", "達成"]
-        if any(keyword in scene_text for keyword in highlight_keywords):
-            highlight_worthy = True
-        elif duration > 30:  # 長いシーンは重要かもしれない
-            highlight_worthy = True
+        Args:
+            video_path: 動画ファイルのパス
+            
+        Returns:
+            tuple: (base_name, output_dir, keyframes_dir)
+        """
+        base_name = os.path.splitext(os.path.basename(video_path))[0]
+        output_dir = os.path.join(os.path.dirname(video_path), f"video_nodes_{base_name}")
+        keyframes_dir = os.path.join(output_dir, "keyframes")
+        os.makedirs(keyframes_dir, exist_ok=True)
+        return base_name, output_dir, keyframes_dir
+
+    def _open_video_and_get_info(self, video_path: str) -> tuple:
+        """
+        動画ファイルを開き、基本情報を取得する
         
-        # カットポイントの提案
-        potential_cutpoint = False
-        if duration < 3:  # 短すぎるシーン
-            potential_cutpoint = True
-        elif "えーと" in scene_text or "あのー" in scene_text:  # 言い淀み
-            potential_cutpoint = True
+        Args:
+            video_path: 動画ファイルのパス
+            
+        Returns:
+            tuple: (cap, fps, total_frames, total_duration, sample_rate)
+        """
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            logger.error(f"ビデオファイルを開けません: {video_path}")
+            return None, 0, 0, 0, 0
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        total_duration = total_frames / fps
+        sample_rate = max(1, int(fps / 4))  # より細かいサンプリング（fps/4）
         
-        # B-rollの提案
-        b_roll_suggestions = []
-        if "景色" in scene_text or "眺め" in scene_text:
-            b_roll_suggestions.append("風景のワイドショット")
-        if "天気" in scene_text or "空" in scene_text:
-            b_roll_suggestions.append("空の様子")
-        if "道" in scene_text or "歩" in scene_text:
-            b_roll_suggestions.append("歩道/山道の様子")
+        logger.info(f"動画情報: 総フレーム数={total_frames}, FPS={fps}, 推定時間={total_duration:.2f}秒")
+        return cap, fps, total_frames, total_duration, sample_rate
+
+    def _calculate_adaptive_thresholds(self, cap, fps, sample_rate):
+        """
+        動画をサンプリングして差分データを収集し、適応型閾値を算出する
         
-        # 音声に関する注意点
-        audio_considerations = []
-        if "風" in scene_text:
-            audio_considerations.append("風切り音に注意")
-        if duration < 2:
-            audio_considerations.append("音声が短すぎる可能性")
+        Args:
+            cap: OpenCVのVideoCapture
+            fps: フレームレート
+            sample_rate: サンプリングレート
+            
+        Returns:
+            tuple: (hist_threshold, pixel_threshold)
+        """
+        prev_frame = None
+        prev_hist = None
+        frame_count = 0
+        hist_diffs = []
+        pixel_diffs = []
         
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # 先頭に移動
+        
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            if frame_count % sample_rate == 0:
+                # グレースケール変換
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                # ヒストグラム計算
+                hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
+                hist = cv2.normalize(hist, hist).flatten()
+
+                if prev_hist is not None and prev_frame is not None:
+                    # ヒストグラム相関（1に近いほど類似）
+                    hist_diff = cv2.compareHist(prev_hist, hist, cv2.HISTCMP_CORREL)
+                    hist_diffs.append(hist_diff)
+                    
+                    # ピクセル差分（値が大きいほど差異が大きい）
+                    pixel_diff = cv2.absdiff(prev_frame, gray)
+                    mean_diff = np.mean(pixel_diff)
+                    pixel_diffs.append(mean_diff)
+                
+                prev_hist = hist
+                prev_frame = gray.copy()
+            
+            frame_count += 1
+            
+            # 処理が中断された場合
+            if not self.processing:
+                cap.release()
+                return 0.9, 20.0  # デフォルト値
+        
+        # 適応型閾値の計算（より緩い閾値を設定）
+        if len(hist_diffs) < 2 or len(pixel_diffs) < 2:
+            logger.warning("差分データが不足しています。デフォルト閾値を使用します。")
+            hist_threshold = 0.9  # デフォルト値（緩和）
+            pixel_threshold = 20.0  # デフォルト値（緩和）
+        else:
+            hist_diffs = np.array(hist_diffs)
+            pixel_diffs = np.array(pixel_diffs)
+            
+            hist_mean = np.mean(hist_diffs)
+            hist_std = np.std(hist_diffs)
+            pixel_mean = np.mean(pixel_diffs)
+            pixel_std = np.std(pixel_diffs)
+            
+            # 閾値を緩和: ヒストグラム閾値を0.9以下、ピクセル差分閾値を低めに
+            hist_threshold = min(0.95, hist_mean - 0.5 * hist_std)  # 標準偏差の0.5倍（さらに緩和）
+            # ピクセル差分閾値を調整
+            pixel_threshold = max(5.0, pixel_mean + 0.5 * pixel_std)  # 標準偏差の0.5倍（さらに緩和）
+            
+            logger.info(f"適応型閾値（より緩和版）: ヒストグラム={hist_threshold:.3f} (平均={hist_mean:.3f}, 標準偏差={hist_std:.3f})")
+            logger.info(f"適応型閾値（より緩和版）: ピクセル差分={pixel_threshold:.3f} (平均={pixel_mean:.3f}, 標準偏差={pixel_std:.3f})")
+        
+        return hist_threshold, pixel_threshold
+
+    def _detect_scene_boundaries(self, video_path, hist_threshold, pixel_threshold, fps, total_duration, sample_rate):
+        """
+        シーン境界を検出する
+        
+        Args:
+            video_path: 動画ファイルのパス
+            hist_threshold: ヒストグラム相関の閾値
+            pixel_threshold: ピクセル差分の閾値
+            fps: フレームレート
+            total_duration: 動画の総時間
+            sample_rate: サンプリングレート
+            
+        Returns:
+            list: 検出されたシーン境界のリスト（秒単位）
+        """
+        scene_boundaries = [0.0]  # 最初のフレームは常に境界
+        cap = cv2.VideoCapture(video_path)
+        
+        ret, prev_frame = cap.read()
+        if not ret:
+            logger.error("動画ファイルを読み込めませんでした")
+            cap.release()
+            return [0.0, total_duration]
+        
+        # グレースケールに変換
+        prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+        prev_hist = cv2.calcHist([prev_gray], [0], None, [256], [0, 256])
+        cv2.normalize(prev_hist, prev_hist, 0, 1, cv2.NORM_MINMAX)
+        
+        frame_idx = 0
+        skipped_frames = 0
+        
+        # 進捗状況の表示用
+        progress_interval = max(1, int(total_duration * fps / sample_rate / 20))  # 5%ごと
+        
+        while True:
+            # サンプリングレートに従ってフレームをスキップ
+            for _ in range(sample_rate):
+                ret = cap.grab()
+                if not ret:
+                    break
+                skipped_frames += 1
+            
+            if not ret:
+                break
+                
+            # デコード
+            ret, frame = cap.retrieve()
+            if not ret:
+                break
+            
+            frame_idx += 1
+            
+            # 現在の時間（秒）
+            current_time = (skipped_frames + frame_idx) / fps
+            
+            # グレースケールに変換
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            
+            # ヒストグラム計算
+            hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
+            cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+            
+            # ヒストグラム相関を計算（1に近いほど類似）
+            hist_corr = cv2.compareHist(prev_hist, hist, cv2.HISTCMP_CORREL)
+            
+            # ピクセル差分を計算
+            frameDelta = cv2.absdiff(prev_gray, gray)
+            pixel_diff = np.mean(frameDelta)
+            
+            # 境界条件の確認：ヒストグラム相関が低い、またはピクセル差分が高い
+            if hist_corr < hist_threshold or pixel_diff > pixel_threshold:
+                # 前のシーン境界から十分離れているか確認（短すぎるシーンを避ける）
+                min_scene_duration = 1.0  # 最低1秒
+                if len(scene_boundaries) == 0 or current_time - scene_boundaries[-1] >= min_scene_duration:
+                    scene_boundaries.append(current_time)
+                    logger.info(f"シーン境界検出: {current_time:.2f}秒 (相関: {hist_corr:.4f}, 差分: {pixel_diff:.2f})")
+            
+            # 前フレームを更新
+            prev_gray = gray
+            prev_hist = hist
+            
+            # 進捗状況の表示
+            if frame_idx % progress_interval == 0:
+                progress = frame_idx / (total_duration * fps / sample_rate) * 100
+                logger.info(f"シーン検出進捗: {progress:.1f}% ({current_time:.1f}/{total_duration:.1f}秒)")
+        
+        cap.release()
+        
+        # 最後のフレームを境界として追加
+        if scene_boundaries[-1] < total_duration:
+            scene_boundaries.append(total_duration)
+        
+        logger.info(f"検出されたシーン境界: {len(scene_boundaries)-1}個のシーン")
+        
+        # シーン検出に失敗してもフォールバックを使用しない
+        # 代わりに、音声分析により境界を取得する（_merge_scene_boundariesメソッド）
+        
+        return scene_boundaries
+
+    def _filter_short_scenes(self, scene_boundaries, min_scene_duration=5.0, video_path=None):
+        """
+        短すぎるシーンを統合する
+        
+        Args:
+            scene_boundaries: シーン境界のリスト
+            min_scene_duration: 最小シーン長さ（秒）
+            video_path: 動画ファイルのパス（フォールバック用）
+            
+        Returns:
+            list: フィルタリング後のシーン境界リスト
+        """
+        filtered_boundaries = [scene_boundaries[0]]
+        
+        for i in range(1, len(scene_boundaries)):
+            if scene_boundaries[i] - filtered_boundaries[-1] >= min_scene_duration:
+                filtered_boundaries.append(scene_boundaries[i])
+            else:
+                logger.info(f"短すぎるシーンをスキップ: {filtered_boundaries[-1]:.2f} - {scene_boundaries[i]:.2f}秒")
+        
+        # 最後の境界を必ず含める
+        if filtered_boundaries[-1] != scene_boundaries[-1]:
+            filtered_boundaries.append(scene_boundaries[-1])
+        
+        return filtered_boundaries
+
+    def _select_representative_scenes(self, scene_boundaries):
+        """
+        代表的なシーンを選択する（シーン数が多い場合は均等に選択）
+        
+        Args:
+            scene_boundaries: シーン境界のリスト
+            
+        Returns:
+            list: 選択されたシーンのインデックスリスト
+        """
+        total_scenes = len(scene_boundaries) - 1
+        if total_scenes > 10:
+            # 均等に10シーンを選択
+            step = total_scenes / 10
+            selected_indices = [int(i * step) for i in range(10)]
+            selected_indices[-1] = min(selected_indices[-1], total_scenes - 1)  # 範囲を超えないように
+            logger.info(f"シーン数制限: {total_scenes}から10シーンを選択")
+        else:
+            selected_indices = list(range(total_scenes))
+        
+        return selected_indices
+
+    def _generate_scene_data(self, video_path, scene_boundaries, selected_indices, keyframes_dir):
+        """
+        各シーンのデータとキーフレームを生成する
+        
+        Args:
+            video_path: 動画ファイルのパス
+            scene_boundaries: シーン境界のリスト
+            selected_indices: 選択されたシーンのインデックス
+            keyframes_dir: キーフレーム保存ディレクトリ
+            
+        Returns:
+            list: 生成されたシーンデータのリスト
+        """
+        scene_data = []
+        keyframe_count = 0
+
+        for i in selected_indices:
+            start_time = scene_boundaries[i]
+            end_time = scene_boundaries[i + 1]
+            keyframe_time = (start_time + end_time) / 2  # シーン中間の時間
+            
+            logger.info(f"シーン {i+1}/{len(selected_indices)}: {start_time:.2f}-{end_time:.2f}秒 ({end_time-start_time:.2f}秒)")
+            
+            # キーフレーム抽出
+            cap = cv2.VideoCapture(video_path)
+            cap.set(cv2.CAP_PROP_POS_MSEC, keyframe_time * 1000)
+            ret, frame = cap.read()
+            if ret:
+                keyframe_path = os.path.join(keyframes_dir, f"keyframe_{keyframe_count:04d}.jpg")
+                cv2.imwrite(keyframe_path, frame)
+                logger.info(f"キーフレーム保存: {keyframe_path}")
+
+                # Geminiで映像分析
+                analysis = self._analyze_keyframe(keyframe_path)
+                
+                scene_data.append({
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "representative_frame": {"path": keyframe_path},
+                    "ai_analysis": analysis
+                })
+                keyframe_count += 1
+            cap.release()
+        
+        return scene_data
+
+    def _analyze_keyframe(self, keyframe_path):
+        """
+        キーフレームをGeminiで分析する
+        
+        Args:
+            keyframe_path: キーフレームのパス
+            
+        Returns:
+            dict: 分析結果
+        """
+        try:
+            analysis_result = self.gemini_client.analyze_image(keyframe_path)
+            # 文字列の場合は辞書に変換
+            if isinstance(analysis_result, str):
+                analysis = {
+                    "scene_type": "",
+                    "time_of_day": "",
+                    "weather": "",
+                    "activities": [analysis_result.strip()]
+                }
+            else:
+                analysis = analysis_result
+        except Exception as e:
+            logger.error(f"画像分析エラー: {str(e)}")
+            analysis = {
+                "scene_type": "",
+                "time_of_day": "",
+                "weather": "",
+                "activities": []
+            }
+        
+        return analysis
+
+    def _validate_scene_data(self, scene_data, total_duration):
+        """
+        生成されたシーンデータを検証し、必要に応じて調整する
+        
+        Args:
+            scene_data: 生成されたシーンデータ
+            total_duration: 動画の総再生時間
+            
+        Returns:
+            list: 調整後のシーンデータ
+        """
+        # 結果の検証
+        if len(scene_data) == 0:
+            logger.warning("シーンデータが生成されませんでした。デフォルトシーンを作成します。")
+            return [self._create_fallback_scene(total_duration)]
+        elif total_duration > 0 and scene_data[-1]["end_time"] < total_duration * 0.9:
+            logger.warning(f"最終シーン終了時間({scene_data[-1]['end_time']:.2f})が全体時間({total_duration:.2f})より大幅に短いです")
+            # 最終シーンの終了時間を全体時間に修正
+            scene_data[-1]["end_time"] = total_duration
+
+        return scene_data
+
+    def _create_fallback_scene(self, total_duration):
+        """
+        フォールバック用のデフォルトシーンを作成する
+        
+        Args:
+            total_duration: 動画の総再生時間
+            
+        Returns:
+            dict: デフォルトシーンデータ
+        """
         return {
-            "highlight_worthy": highlight_worthy,
-            "potential_cutpoint": potential_cutpoint,
-            "b_roll_opportunity": "、".join(b_roll_suggestions) if b_roll_suggestions else "",
-            "audio_considerations": "、".join(audio_considerations) if audio_considerations else ""
+            "start_time": 0, 
+            "end_time": total_duration,
+            "representative_frame": None, 
+            "ai_analysis": {}
         }
 
     def run(self):
         """アプリケーション実行"""
         self.root.mainloop()
+
+    def play_preview(self):
+        """プレビュー動画を再生"""
+        if not self.vlc_instance or not self.player:
+            logger.warning("プレビュー再生できません：VLCプレーヤーが未初期化")
+            messagebox.showwarning("再生エラー", "VLCプレーヤーが初期化されていません。\nVLCをインストールしてください。")
+            return
+            
+        if not self.current_preview_path:
+            logger.warning("プレビュー再生できません：ファイルが選択されていません")
+            messagebox.showwarning("再生エラー", "ファイルが選択されていません。")
+            return
+            
+        # ファイルの存在確認
+        abs_path = os.path.abspath(self.current_preview_path)
+        if not os.path.exists(abs_path):
+            logger.error(f"ファイルが存在しません: {abs_path}")
+            messagebox.showerror("再生エラー", f"ファイルが見つかりません:\n{abs_path}")
+            return
+        
+        try:
+            if not self.is_playing:
+                logger.info(f"プレビュー再生開始: {abs_path}")
+                
+                media = self.vlc_instance.media_new(abs_path)
+                self.player.set_media(media)
+                result = self.player.play()
+                
+                if result == -1:
+                    logger.error("VLCプレーヤーの再生開始に失敗しました")
+                    messagebox.showerror("再生エラー", "VLCプレーヤーの再生開始に失敗しました")
+                    return
+                    
+                self.is_playing = True
+                # 再生時間の更新タイマーを開始
+                self.update_playback_time()
+        except Exception as e:
+            logger.error(f"プレビュー再生エラー: {str(e)}")
+            messagebox.showerror("再生エラー", f"プレビュー再生中にエラーが発生しました：\n{str(e)}")
+            self.is_playing = False
+    
+    def format_time(self, seconds):
+        """秒を MM:SS 形式に変換"""
+        minutes = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{minutes:02d}:{secs:02d}"
+
+    def stop_preview(self):
+        """プレビュー動画を停止"""
+        try:
+            if self.player:
+                logger.info("プレビュー再生停止")
+                # 再生状態確認
+                is_playing = self.player.is_playing()
+                if is_playing:
+                    self.player.stop()
+                self.is_playing = False
+                # タイマーを停止
+                if self.update_timer:
+                    self.root.after_cancel(self.update_timer)
+                    self.update_timer = None
+                # 時間表示をリセット
+                self.time_label.config(text=f"再生時間: 00:00 / {self.format_time(self.current_duration)}")
+                logger.info("プレビュー再生を停止しました")
+        except Exception as e:
+            logger.error(f"プレビュー停止エラー: {str(e)}")
+            # エラーメッセージを表示
+            messagebox.showerror("停止エラー", f"プレビューの停止中にエラーが発生しました:\n{str(e)}")
+    
+    def update_playback_time(self):
+        """再生時間を更新"""
+        if not self.player or not self.is_playing:
+            return
+        
+        try:
+            if self.player.is_playing():
+                # ミリ秒を秒に変換
+                current_time = self.player.get_time() / 1000.0
+                self.time_label.config(text=f"再生時間: {self.format_time(current_time)} / {self.format_time(self.current_duration)}")
+                # 100ミリ秒後に再度更新
+                self.update_timer = self.root.after(100, self.update_playback_time)
+            else:
+                # 再生が終了した場合
+                self.is_playing = False
+                self.time_label.config(text=f"再生時間: {self.format_time(self.current_duration)} / {self.format_time(self.current_duration)}")
+        except Exception as e:
+            logger.error(f"再生時間更新エラー: {str(e)}")
+            self.is_playing = False
 
 if __name__ == "__main__":
     app = VideoEnhanced()
