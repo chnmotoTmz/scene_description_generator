@@ -17,7 +17,7 @@ class EnhancedSceneDetector:
                  min_scene_duration: float = 3.0,
                  hist_threshold: float = 0.9,
                  pixel_threshold: float = 20.0,
-                 sample_rate: int = 4):
+                 sample_rate: int = 20):
         """
         初期化
         
@@ -25,7 +25,7 @@ class EnhancedSceneDetector:
             min_scene_duration: 最小シーン長さ（秒）
             hist_threshold: ヒストグラム相関閾値（低いほど敏感）
             pixel_threshold: ピクセル差分閾値（高いほど敏感）
-            sample_rate: サンプリングレート（フレーム数）
+            sample_rate: サンプリングレート（フレーム数）- 高いほど処理が速くなるが精度が低下
         """
         self.min_scene_duration = min_scene_duration
         self.hist_threshold = hist_threshold
@@ -39,6 +39,8 @@ class EnhancedSceneDetector:
         self.scene_boundaries = []
         self.keyframes = []
         
+        logger.info(f"EnhancedSceneDetector初期化: sample_rate={sample_rate} (高速モード), min_scene_duration={min_scene_duration}")
+        
     def set_progress_callback(self, callback):
         """進捗報告用コールバックを設定"""
         self.progress_callback = callback
@@ -48,13 +50,14 @@ class EnhancedSceneDetector:
         if self.progress_callback:
             self.progress_callback(progress, message)
         
-    def detect_scenes(self, video_path: str, output_dir: str = None) -> List[Dict]:
+    def detect_scenes(self, video_path: str, output_dir: str = None, max_duration: float = None) -> List[Dict]:
         """
         動画からシーンを検出
         
         Args:
             video_path: 動画ファイルのパス
             output_dir: 出力ディレクトリ（指定がなければ動画と同じディレクトリ）
+            max_duration: 処理する最大時間（秒）。Noneの場合は動画全体を処理
             
         Returns:
             List[Dict]: 検出されたシーンのリスト
@@ -73,18 +76,24 @@ class EnhancedSceneDetector:
             if not cap:
                 return self._create_fallback_scene(total_duration=0)
             
+            # 最大時間が指定されている場合、処理時間を制限
+            if max_duration is not None and max_duration > 0:
+                total_duration = min(total_duration, max_duration)
+                total_frames = min(total_frames, int(max_duration * fps))
+                logger.info(f"最大時間を{max_duration}秒に制限して処理します（実際の処理時間: {total_duration:.2f}秒）")
+            
             self.report_progress(5, "動画情報を取得しました")
             
             # 第1パス: 差分値を収集して適応型閾値を算出
             hist_threshold, pixel_threshold = self._calculate_adaptive_thresholds(
-                cap, fps, self.sample_rate
+                cap, fps, self.sample_rate, max_frames=total_frames
             )
             
             self.report_progress(30, "適応型閾値を計算しました")
             
             # 第2パス: シーン境界を検出
             self.scene_boundaries = self._detect_scene_boundaries(
-                video_path, hist_threshold, pixel_threshold, fps, total_duration
+                video_path, hist_threshold, pixel_threshold, fps, total_duration, max_frames=total_frames
             )
             
             self.report_progress(60, f"{len(self.scene_boundaries)-1}個のシーン候補を検出しました")
@@ -106,6 +115,13 @@ class EnhancedSceneDetector:
             # 結果の検証と調整
             scene_data = self._validate_scene_data(scene_data, total_duration)
             
+            # 時間制限が指定されている場合、最終シーンの終了時間を調整
+            if max_duration is not None and scene_data:
+                for scene in scene_data:
+                    if scene["end_time"] > max_duration:
+                        scene["end_time"] = max_duration
+                        scene["duration"] = scene["end_time"] - scene["start_time"]
+            
             self.report_progress(100, "シーン検出が完了しました")
             
             return scene_data
@@ -114,7 +130,8 @@ class EnhancedSceneDetector:
             logger.error(f"シーン検出エラー: {str(e)}", exc_info=True)
             # エラー時は動画全体を1シーンとして返す
             return [self._create_fallback_scene(
-                total_duration=total_frames / fps if 'total_frames' in locals() and 'fps' in locals() else 0.0
+                total_duration=max_duration if max_duration is not None else 
+                (total_frames / fps if 'total_frames' in locals() and 'fps' in locals() else 0.0)
             )]
     
     def _open_video_and_get_info(self, video_path: str) -> Tuple:
@@ -139,7 +156,7 @@ class EnhancedSceneDetector:
         logger.info(f"動画情報: 総フレーム数={total_frames}, FPS={fps}, 推定時間={total_duration:.2f}秒")
         return cap, fps, total_frames, total_duration
     
-    def _calculate_adaptive_thresholds(self, cap, fps, sample_rate):
+    def _calculate_adaptive_thresholds(self, cap, fps, sample_rate, max_frames=None):
         """
         動画をサンプリングして差分データを収集し、適応型閾値を算出する
         
@@ -147,6 +164,7 @@ class EnhancedSceneDetector:
             cap: OpenCVのVideoCapture
             fps: フレームレート
             sample_rate: サンプリングレート
+            max_frames: 処理する最大フレーム数（Noneの場合は全フレーム処理）
             
         Returns:
             tuple: (hist_threshold, pixel_threshold)
@@ -160,9 +178,12 @@ class EnhancedSceneDetector:
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # 先頭に移動
         
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if max_frames is not None:
+            total_frames = min(total_frames, max_frames)
+            
         progress_interval = max(1, total_frames // 100)  # 進捗報告間隔
         
-        while cap.isOpened():
+        while cap.isOpened() and (max_frames is None or frame_count < max_frames):
             ret, frame = cap.read()
             if not ret:
                 break
@@ -193,6 +214,10 @@ class EnhancedSceneDetector:
                 prev_frame = gray.copy()
             
             frame_count += 1
+            
+            # 最大フレーム数に達したら終了
+            if max_frames is not None and frame_count >= max_frames:
+                break
         
         # 適応型閾値の計算
         if len(hist_diffs) < 2 or len(pixel_diffs) < 2:
@@ -217,51 +242,68 @@ class EnhancedSceneDetector:
         
         return hist_threshold, pixel_threshold
     
-    def _detect_scene_boundaries(self, video_path, hist_threshold, pixel_threshold, fps, total_duration):
+    def _detect_scene_boundaries(self, video_path, hist_threshold, pixel_threshold, fps, total_duration, max_frames=None):
         """
         シーン境界を検出する
         
         Args:
             video_path: 動画ファイルのパス
-            hist_threshold: ヒストグラム相関閾値
-            pixel_threshold: ピクセル差分閾値
+            hist_threshold: ヒストグラム閾値
+            pixel_threshold: ピクセル閾値
             fps: フレームレート
-            total_duration: 動画の総再生時間
+            total_duration: 動画の長さ（秒）
+            max_frames: 処理する最大フレーム数（Noneの場合は全フレーム処理）
             
         Returns:
-            list: シーン境界のリスト
+            list: シーン境界（秒）のリスト
         """
+        # 動画を開く
         cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            logger.error(f"ビデオファイルを開けません: {video_path}")
+            return [0.0, total_duration]
+
+        # 基本情報
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if max_frames is not None:
+            total_video_frames = min(total_video_frames, max_frames)
+        logger.info(f"シーン検出: 閾値=[ヒストグラム:{hist_threshold:.3f}, ピクセル:{pixel_threshold:.1f}]")
         
+        # 検出に使用するパラメータ
+        sample_rate = self.sample_rate
+        min_scene_len = int(fps * 0.5)  # 0.5秒未満のシーンは除外
+        boundaries = [0.0]  # 常に0秒から開始
+        
+        # フレーム処理用の変数
         prev_frame = None
         prev_hist = None
-        frame_idx = 0
-        current_time = 0.0
+        frame_count = 0
+        scene_frames = []
+        progress_interval = max(1, total_video_frames // 200)  # 進捗報告間隔
         
-        # 境界リスト（最初は0秒から開始）
-        scene_boundaries = [0.0]
+        # 先頭に移動
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         
-        # サンプリングレート
-        sample_rate = self.sample_rate
-        
-        # 進捗報告用
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        progress_interval = max(1, total_frames // 100)
-        
+        # フレームを順に処理
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
-            
-            # 現在の時間を計算
-            current_time = frame_idx / fps
-            
-            if frame_idx % sample_rate == 0:
-                # 進捗報告
-                if frame_idx % progress_interval == 0:
-                    progress = 30 + (frame_idx / total_frames) * 30  # 30%～60%の進捗
-                    self.report_progress(progress, f"シーン検出中... ({frame_idx}/{total_frames}フレーム)")
                 
+            frame_count += 1
+            
+            # 最大フレーム数に達したら終了
+            if max_frames is not None and frame_count > max_frames:
+                break
+            
+            # 進捗報告
+            if frame_count % progress_interval == 0:
+                progress = 30 + (frame_count / total_video_frames) * 30  # 30%-60%の進捗
+                self.report_progress(int(progress), f"シーン検出中... ({frame_count}/{total_video_frames}フレーム)")
+            
+            # サンプリングレートに基づいてフレームを処理
+            if frame_count % sample_rate == 0:
                 # グレースケール変換
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 
@@ -271,35 +313,54 @@ class EnhancedSceneDetector:
                 
                 if prev_hist is not None and prev_frame is not None:
                     # ヒストグラム相関（1に近いほど類似）
-                    hist_correl = cv2.compareHist(prev_hist, hist, cv2.HISTCMP_CORREL)
+                    hist_corr = cv2.compareHist(prev_hist, hist, cv2.HISTCMP_CORREL)
                     
-                    # ピクセル差分（値が大きいほど差異が大きい）
+                    # ピクセル差分
                     pixel_diff = cv2.absdiff(prev_frame, gray)
                     mean_diff = np.mean(pixel_diff)
                     
-                    # シーン変化の検出（ヒストグラム相関が閾値以下、またはピクセル差分が閾値以上）
-                    if hist_correl < hist_threshold or mean_diff > pixel_threshold:
-                        # 前回の境界から十分離れているか確認
-                        if len(scene_boundaries) == 0 or (current_time - scene_boundaries[-1]) >= self.min_scene_duration:
-                            scene_boundaries.append(current_time)
-                            logger.info(f"シーン境界検出: {current_time:.2f}秒 (ヒストグラム相関={hist_correl:.3f}, ピクセル差分={mean_diff:.3f})")
-                            
-                            # キーフレームを保存（後で使用）
-                            self.keyframes.append((current_time, frame.copy()))
+                    # シーン変化の判定
+                    is_new_scene = False
+                    
+                    # 条件1: ヒストグラム相関が閾値より低い（大きな変化）
+                    if hist_corr < hist_threshold:
+                        is_new_scene = True
+                        logger.debug(f"ヒストグラム変化を検出: {frame_count}, 相関値={hist_corr:.4f}")
+                    
+                    # 条件2: ピクセル差分が閾値より高い（大きな変化）
+                    elif mean_diff > pixel_threshold:
+                        is_new_scene = True
+                        logger.debug(f"ピクセル変化を検出: {frame_count}, 差分値={mean_diff:.2f}")
+                    
+                    # 新しいシーンの開始
+                    if is_new_scene:
+                        # 直前のシーンが短すぎないかチェック
+                        if not scene_frames or frame_count - scene_frames[-1] > min_scene_len:
+                            scene_frames.append(frame_count)
+                            timestamp = frame_count / fps
+                            boundaries.append(timestamp)
+                            logger.debug(f"シーン境界検出: {timestamp:.2f}秒")
                 
+                # 現在のフレームを保存
                 prev_hist = hist
                 prev_frame = gray.copy()
-            
-            frame_idx += 1
         
+        # 動画の最後の時間を追加
+        if max_frames is not None:
+            # 最大フレーム数に制限されている場合
+            end_time = min(total_duration, max_frames / fps)
+        else:
+            # 動画全体を処理した場合
+            end_time = total_duration
+            
+        if not boundaries or boundaries[-1] < end_time:
+            boundaries.append(end_time)
+        
+        # リソース開放
         cap.release()
         
-        # 最後のフレームを境界として追加
-        if scene_boundaries[-1] < total_duration:
-            scene_boundaries.append(total_duration)
-        
-        logger.info(f"検出されたシーン境界: {len(scene_boundaries)-1}個のシーン")
-        return scene_boundaries
+        logger.info(f"検出されたシーン境界: {len(boundaries)-1}個のシーン")
+        return boundaries
     
     def _filter_short_scenes(self, scene_boundaries, min_scene_duration=3.0):
         """
@@ -342,32 +403,49 @@ class EnhancedSceneDetector:
             list: 生成されたシーンデータのリスト
         """
         scene_data = []
+        start_time = time.time()
         
         # 各シーンについて処理
         for i in range(len(scene_boundaries) - 1):
-            start_time = scene_boundaries[i]
-            end_time = scene_boundaries[i + 1]
+            start_time_scene = scene_boundaries[i]
+            end_time_scene = scene_boundaries[i + 1]
             
             # 進捗報告
             progress = 70 + (i / (len(scene_boundaries) - 1)) * 20  # 70%～90%の進捗
             self.report_progress(progress, f"シーン {i+1}/{len(scene_boundaries)-1} を処理中...")
             
             # シーンの中間点でキーフレームを抽出
-            keyframe_time = (start_time + end_time) / 2
-            keyframe_path = os.path.join(keyframes_dir, f"keyframe_{i:04d}.jpg")
+            keyframe_time = (start_time_scene + end_time_scene) / 2
+            keyframe_filename = f"keyframe_{i:04d}.jpg"
+            keyframe_path = os.path.join(keyframes_dir, keyframe_filename)
             
             # キーフレーム抽出
-            self._extract_keyframe(video_path, keyframe_time, keyframe_path)
+            extraction_success = self._extract_keyframe(video_path, keyframe_time, keyframe_path)
+            if not extraction_success:
+                logger.warning(f"シーン {i+1} のキーフレーム抽出に失敗しました。再試行します。")
+                # 異なる時間で再試行
+                retry_time = start_time_scene + (end_time_scene - start_time_scene) * 0.25
+                extraction_success = self._extract_keyframe(video_path, retry_time, keyframe_path)
+                if not extraction_success:
+                    logger.error(f"シーン {i+1} のキーフレーム再抽出にも失敗しました。")
+            
+            # キーフレームパスを絶対パスに変換（JSONに保存するため）
+            abs_keyframe_path = os.path.abspath(keyframe_path) if extraction_success else None
             
             # シーンデータを作成
             scene_data.append({
                 "scene_id": i,
-                "start_time": start_time,
-                "end_time": end_time,
-                "duration": end_time - start_time,
-                "keyframe_path": keyframe_path,
-                "keyframe_time": keyframe_time
+                "start_time": start_time_scene,
+                "end_time": end_time_scene,
+                "duration": end_time_scene - start_time_scene,
+                "keyframe_path": abs_keyframe_path,
+                "keyframe_filename": keyframe_filename,  # ファイル名も保存
+                "keyframe_time": keyframe_time,
+                "extraction_success": extraction_success
             })
+        
+        end_time = time.time()
+        logger.info(f"シーンデータ生成完了: {len(scene_data)}個のシーン, 処理時間: {end_time - start_time:.2f}秒")
         
         return scene_data
     
@@ -441,7 +519,9 @@ class EnhancedSceneDetector:
             "end_time": total_duration,
             "duration": total_duration,
             "keyframe_path": None,
-            "keyframe_time": 0
+            "keyframe_filename": None,
+            "keyframe_time": 0,
+            "extraction_success": False
         }
     
     def merge_with_audio_boundaries(self, audio_boundaries):
